@@ -2,6 +2,7 @@
 # Project-specific ignores
 # =========================
 data/
+demo/
 result/
 third_party/
 opera.egg-info/
@@ -108,3 +109,4 @@ docs/_build/
 *.log
 .cursorignore
 .cursorindexingignore
+demo/demo.gif
