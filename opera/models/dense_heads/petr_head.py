@@ -98,7 +98,7 @@ class PETRHead(AnchorFreeHead):
         # since it brings inconvenience when the initialization of
         # `AnchorFreeHead` is called.
         super(AnchorFreeHead, self).__init__(init_cfg)
-        self.loss_hm = build_loss(loss_hm)
+        #self.loss_hm = build_loss(loss_hm)
         # ====== ADD for token distill ======
         self.distill_stage = distill_stage
         self.token_dim = token_dim
@@ -474,26 +474,23 @@ class PETRHead(AnchorFreeHead):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
+
         assert proposal_cfg is None, '"proposal_cfg" must be None'
-        # ====== ADD: fetch gt_token ======
+
         if gt_token is None:
             gt_token = kwargs.get('gt_token', None)
-        # =================================
-        # outs = self(x, img_metas)
-        # memory = outs[-1]
-        # outs = outs[:-1]
 
         outs = self(x, img_metas)
         memory = outs[-1]
+        loss_token = None
 
-        # ====== ADD: token pred & loss ======
+        # ====== token pred & loss ======
         if self.with_token_distill and self.distill_stage in (1, 2):
             bs = len(img_metas)
 
             if gt_token is None:
                 raise ValueError("gt_token is required for distill_stage=1/2, but got None")
 
-            # gt_token could be Tensor (bs,768) or list[Tensor(768,)]
             if isinstance(gt_token, (list, tuple)):
                 gt_token = torch.stack([t.to(memory.device).float() for t in gt_token], dim=0)  # (bs,768)
             else:
@@ -501,50 +498,114 @@ class PETRHead(AnchorFreeHead):
                 if gt_token.dim() == 1:
                     gt_token = gt_token.unsqueeze(0)  # (1,768)
 
-            pooled = self._pool_memory(memory, bs)  # (bs,embed_dims)
-            pred_token = self.token_head(pooled)  # (bs,768)
+            if gt_token.dim() != 2 or gt_token.size(1) != self.token_dim:
+                raise ValueError(f"gt_token shape should be (B,{self.token_dim}), but got {tuple(gt_token.shape)}")
 
-            # ===== 调试打印：放这里最安全 =====
-            if torch.rand(1).item() < 0.01:
-                print(
-                    "[DBG] gt_token:", tuple(gt_token.shape),
-                    "pred_token:", tuple(pred_token.shape),
-                    "gt[min,max]:", float(gt_token.min()), float(gt_token.max()),
-                    "pred[min,max]:", float(pred_token.min()), float(pred_token.max())
-                )
+            pooled = self._pool_memory(memory, bs)  # (bs, embed_dims)
+            pred_token = self.token_head(pooled)  # (bs, 768)
 
             loss_token = self.loss_token(pred_token, gt_token)
 
             # Stage1: ONLY token loss
             if self.distill_stage == 1:
-                # if torch.rand(1).item() < 0.01:
-                #     print("[DBG] gt_token:", gt_token.shape, gt_token.dtype, "student_token:", student_token.shape)
                 return dict(loss_token=loss_token)
 
         # ===================================
 
-        # keep original behavior for stage2 / no-distill
         outs = outs[:-1]
 
         if gt_labels is None:
             loss_inputs = outs + (gt_bboxes, gt_keypoints, gt_areas, img_metas)
         else:
-            loss_inputs = outs + (gt_bboxes, gt_labels, gt_keypoints, gt_areas,
-                                  img_metas)
-        losses_and_targets = self.loss(
-            *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
-        losses, refine_targets = losses_and_targets
-        # get pose refinement loss
-        if self.with_kpt_refine:
-            losses = self.forward_refine(memory, refine_targets,
-                                        losses, img_metas)
+            loss_inputs = outs + (gt_bboxes, gt_labels, gt_keypoints, gt_areas, img_metas)
 
-        # ====== ADD: stage2 attach token loss ======
-        if self.with_token_distill and self.distill_stage == 2:
+        losses_and_targets = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+        losses, refine_targets = losses_and_targets
+
+        if self.with_kpt_refine:
+            losses = self.forward_refine(memory, refine_targets, losses, img_metas)
+
+        # Stage2: joint training
+        if self.with_token_distill and self.distill_stage == 2 and loss_token is not None:
             losses['loss_token'] = loss_token
-        # ==========================================
 
         return losses
+
+        # assert proposal_cfg is None, '"proposal_cfg" must be None'
+        # # ====== ADD: fetch gt_token ======
+        # if gt_token is None:
+        #     gt_token = kwargs.get('gt_token', None)
+        # # =================================
+        # # outs = self(x, img_metas)
+        # # memory = outs[-1]
+        # # outs = outs[:-1]
+        #
+        # outs = self(x, img_metas)
+        # memory = outs[-1]
+        # loss_token = None
+        #
+        # # ====== ADD: token pred & loss ======
+        # if self.with_token_distill and self.distill_stage in (1, 2):
+        #     bs = len(img_metas)
+        #
+        #     if gt_token is None:
+        #         raise ValueError("gt_token is required for distill_stage=1/2, but got None")
+        #
+        #     # gt_token could be Tensor (bs,768) or list[Tensor(768,)]
+        #     if isinstance(gt_token, (list, tuple)):
+        #         gt_token = torch.stack([t.to(memory.device).float() for t in gt_token], dim=0)  # (bs,768)
+        #     else:
+        #         gt_token = gt_token.to(memory.device).float()
+        #         if gt_token.dim() == 1:
+        #             gt_token = gt_token.unsqueeze(0)  # (1,768)
+        #
+        #     if gt_token.dim() != 2 or gt_token.size(1) != self.token_dim:
+        #         raise ValueError(f"gt_token shape should be (B,{self.token_dim}), but got {tuple(gt_token.shape)}")
+        #
+        #     pooled = self._pool_memory(memory, bs)  # (bs,embed_dims)
+        #     pred_token = self.token_head(pooled)  # (bs,768)
+        #
+        #     # ===== 调试打印：放这里最安全 =====
+        #     # if torch.rand(1).item() < 0.01:
+        #     #     print(
+        #     #         "[DBG] gt_token:", tuple(gt_token.shape),
+        #     #         "pred_token:", tuple(pred_token.shape),
+        #     #         "gt[min,max]:", float(gt_token.min()), float(gt_token.max()),
+        #     #         "pred[min,max]:", float(pred_token.min()), float(pred_token.max())
+        #     #     )
+        #
+        #     loss_token = self.loss_token(pred_token, gt_token)
+        #
+        #     # Stage1: ONLY token loss
+        #     if self.distill_stage == 1:
+        #         # if torch.rand(1).item() < 0.01:
+        #         #     print("[DBG] gt_token:", gt_token.shape, gt_token.dtype, "student_token:", student_token.shape)
+        #         return dict(loss_token=loss_token)
+        #
+        # # ===================================
+        #
+        # # keep original behavior for stage2 / no-distill
+        # outs = outs[:-1]
+        #
+        # if gt_labels is None:
+        #     loss_inputs = outs + (gt_bboxes, gt_keypoints, gt_areas, img_metas)
+        # else:
+        #     loss_inputs = outs + (gt_bboxes, gt_labels, gt_keypoints, gt_areas,
+        #                           img_metas)
+        # losses_and_targets = self.loss(
+        #     *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+        # losses, refine_targets = losses_and_targets
+        # # get pose refinement loss
+        # if self.with_kpt_refine:
+        #     losses = self.forward_refine(memory, refine_targets,
+        #                                 losses, img_metas)
+        #
+        # # ====== ADD: stage2 attach token loss ======
+        # if self.with_token_distill and self.distill_stage == 2:
+        #     losses['loss_token'] = loss_token
+        # # ==========================================
+        #
+        # return losses
 
     @force_fp32(apply_to=('all_cls_scores', 'all_kpt_preds'))
     def loss(self,
