@@ -156,9 +156,10 @@ model = dict(
         num_keypoints=14,
         # ===== Stage1 token distill (新增) =====
         distill_token=True,
-        distill_stage=2,           # <<< Stage2: token + task
+        distill_stage=0,           # <<< Stage2: token + task
         token_dim=768,
-        loss_token=dict(type='mmdet.MSELoss', loss_weight=0.1),
+        #loss_token=dict(type='mmdet.MSELoss', loss_weight=0.1),
+        loss_token=None,
         # =======================================
         transformer=dict(
             type='opera.PETRTransformer',
@@ -269,7 +270,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2)) # max_norm=0.
 lr_config = dict(policy='step', step=[400]) #400
 runner = dict(type='EpochBasedRunner', max_epochs=450) #450
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_stage2_joint_450'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_stage2_init_only'
 auto_resume = False
 #gpu_ids = range(0, 3)
 gpu_ids = range(0, 1)
