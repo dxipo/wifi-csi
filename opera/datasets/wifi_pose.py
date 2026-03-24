@@ -72,47 +72,25 @@ class WifiPoseDataset(dataset):
 
         #keypoint = self.keypoint_process(keypoint)
         #keypoint = torch.FloatTensor(keypoint) # keypoint tensor: (N*14*3)
+        keypoint_raw = torch.from_numpy(np.load(keypoint_path)).float()  # (N,14,3) or (N,14,2)
 
-        # keypoint_raw = torch.from_numpy(np.load(keypoint_path)).float()  # (N,14,3) or (N,14,2)
-        #
-        # keypoint_xy = keypoint_raw[..., :2]  # (N,14,2)
-        # if keypoint_raw.shape[-1] >= 3:
-        #     keypoint_v = keypoint_raw[..., 2:3]  # (N,14,1) 保留原始可见性/置信度
-        # else:
-        #     keypoint_v = torch.ones(keypoint_xy.shape[0], 14, 1, dtype=keypoint_xy.dtype)  # 没有就补1
-        #
-        # W, H = 640.0, 360.0
-        # keypoint_xy[..., 0] = keypoint_xy[..., 0] / W
-        # keypoint_xy[..., 1] = keypoint_xy[..., 1] / H
-        # keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
-        #
-        # keypoint = torch.cat([keypoint_xy, keypoint_v], dim=2)  # (N,14,3)
-        #
-        # assert keypoint.ndim == 3 and keypoint.shape[1] == 14 and keypoint.shape[2] == 3, \
-        #     f"bad keypoint shape: {keypoint.shape}"
+        keypoint_xy = keypoint_raw[..., :2]  # (N,14,2)
+        if keypoint_raw.shape[-1] >= 3:
+            keypoint_v = keypoint_raw[..., 2:3]  # (N,14,1) 保留原始可见性/置信度
+        else:
+            keypoint_v = torch.ones(keypoint_xy.shape[0], 14, 1, dtype=keypoint_xy.dtype)  # 没有就补1
 
-
-
-        keypoint = torch.FloatTensor(np.load(keypoint_path))  # (N,14,3) or (N,14,2)
-
-        # 只取 x,y 并归一化到 [0,1]
-        keypoint_xy = keypoint[..., :2]
         W, H = 640.0, 360.0
         keypoint_xy[..., 0] = keypoint_xy[..., 0] / W
         keypoint_xy[..., 1] = keypoint_xy[..., 1] / H
         keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
 
-        # ✅ 统一补 vis=1，保证 shape (N,14,3)
-        vis = torch.ones((keypoint_xy.shape[0], 14, 1), dtype=keypoint_xy.dtype)
-        keypoint = torch.cat([keypoint_xy, vis], dim=2)  # (N,14,3)
+        keypoint = torch.cat([keypoint_xy, keypoint_v], dim=2)  # (N,14,3)
 
-        # --- sanity check ---
-        assert keypoint.ndim == 3 and keypoint.shape[1] == 14, f"bad keypoint shape: {keypoint.shape}"
-        assert keypoint.shape[2] == 3, f"need (x,y,vis): {keypoint.shape}"
+        assert keypoint.ndim == 3 and keypoint.shape[1] == 14 and keypoint.shape[2] == 3, \
+            f"bad keypoint shape: {keypoint.shape}"
 
-        if index < 3:
-            print("[wifi_pose] img:", csi.shape, "kpt:", keypoint.shape,
-                  "kpt_minmax_xy:", keypoint[..., :2].min().item(), keypoint[..., :2].max().item())
+
 
         # keypoint = torch.FloatTensor(np.load(keypoint_path))  # (N,14,3) or (N,14,2)
         # # 只取 x,y
@@ -144,18 +122,8 @@ class WifiPoseDataset(dataset):
         # --- END ADD ---
 
         # ---- ADD: load teacher token ----
-        # ---- ADD: load teacher token ----
-        if not os.path.exists(token_path):
-            raise FileNotFoundError(f"[WifiPoseDataset] token not found: {token_path}")
-
-        gt_token = np.load(token_path).astype(np.float32)  # (768,)
-        gt_token = torch.from_numpy(gt_token)  # torch.Size([768])
+        gt_token = torch.from_numpy(np.load(token_path).astype(np.float32)).contiguous()  # (768,)
         assert gt_token.ndim == 1 and gt_token.shape[0] == 768, f"bad token shape: {gt_token.shape}"
-        # ---- END ADD ----
-
-
-        # gt_token = torch.from_numpy(np.load(token_path).astype(np.float32)).contiguous()  # (768,)
-        # assert gt_token.ndim == 1 and gt_token.shape[0] == 768, f"bad token shape: {gt_token.shape}"
 
         # gt_token = np.load(token_path).astype(np.float32)  # (768,)
         # gt_token = torch.from_numpy(gt_token)  # torch.Size([768])
@@ -225,8 +193,7 @@ class WifiPoseDataset(dataset):
 
         numOfPerson = keypoint.shape[0]
         gt_labels = np.zeros(numOfPerson, dtype=np.int64) #label (N,)
-        #gt_bboxes = torch.tensor([])
-        gt_bboxes = torch.zeros((0, 4), dtype=torch.float32)
+        gt_bboxes = torch.tensor([])
         gt_areas = torch.tensor([])
         result = dict(img=csi, gt_keypoints=keypoint, gt_labels = gt_labels, gt_bboxes = gt_bboxes, gt_areas = gt_areas )
         return result

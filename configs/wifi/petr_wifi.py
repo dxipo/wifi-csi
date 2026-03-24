@@ -13,10 +13,10 @@ data_root = '../data/wifipose'
 train_pipeline = [
     dict(
         type='opera.DefaultFormatBundle',
-        extra_keys=['gt_keypoints', 'gt_labels', 'gt_token']),  # <<< 加 gt_token
+        extra_keys=['gt_keypoints', 'gt_labels']),
     dict(
         type='mmdet.Collect',
-        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas', 'gt_token'],  # <<< 加 gt_token
+        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas'],
         meta_keys=[])
 ]
 
@@ -38,30 +38,17 @@ data = dict(
     train=dict(
         type='opera.WifiPoseDataset',
         dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out',
-        # pipeline=[
-        #     dict(
-        #         type='opera.DefaultFormatBundle',
-        #         extra_keys=['gt_keypoints', 'gt_labels']),
-        #     dict(
-        #         type='mmdet.Collect',
-        #         keys=[
-        #             'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas'
-        #         ],
-        #         meta_keys=[])
-        # ],
-
         pipeline=[
             dict(
                 type='opera.DefaultFormatBundle',
-                extra_keys=['gt_keypoints', 'gt_labels', 'gt_token']),   # <<< 加 gt_token
+                extra_keys=['gt_keypoints', 'gt_labels']),
             dict(
                 type='mmdet.Collect',
                 keys=[
-                    'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas', 'gt_token'   # <<< 加 gt_token
+                    'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas'
                 ],
                 meta_keys=[])
         ],
-
         mode='train'),
     val=dict(
         type='opera.WifiPoseDataset',
@@ -154,12 +141,6 @@ model = dict(
         with_kpt_refine=True,
         as_two_stage=True,
         num_keypoints=14,
-        # ===== Stage1 token distill (新增) =====
-        distill_token=True,
-        distill_stage=1,           # 1=只算token loss；2=token+task；0=不蒸馏
-        token_dim=768,
-        loss_token=dict(type='mmdet.MSELoss', loss_weight=1.0),
-        # =======================================
         transformer=dict(
             type='opera.PETRTransformer',
             num_keypoints=14,
@@ -231,10 +212,10 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=0.0),# <<< 4.0 -> 0.0
+            loss_weight=4.0),
         #loss_kpt=dict(type='mmdet.MSELoss', loss_weight=70.0),
-        loss_kpt=dict(type='mmdet.MSELoss', loss_weight=0.0), # <<< 10.0 -> 0.0
-        loss_kpt_rpn=dict(type='mmdet.MSELoss', loss_weight=0.0), # <<< 10.0 -> 0.0
+        loss_kpt=dict(type='mmdet.MSELoss', loss_weight=10.0),
+        loss_kpt_rpn=dict(type='mmdet.MSELoss', loss_weight=10.0),
         # loss_oks=dict(type='opera.OKSLoss', loss_weight=2.0),
         # loss_hm=dict(type='opera.CenterFocalLoss', loss_weight=4.0),
         # loss_kpt_refine=dict(type='mmdet.MSELoss', loss_weight=70.0),
@@ -250,9 +231,9 @@ model = dict(
     train_cfg=dict(
         assigner=dict(
             type='opera.PoseHungarianAssigner',
-            cls_cost=dict(type='mmdet.FocalLossCost', weight=0.0),# <<< 4.0 -> 0.0
+            cls_cost=dict(type='mmdet.FocalLossCost', weight=4.0),
             #kpt_cost=dict(type='opera.KptMSECost', weight=70.0),
-            kpt_cost=dict(type='opera.KptMSECost', weight=0.0),# <<< 10.0 -> 0.0
+            kpt_cost=dict(type='opera.KptMSECost', weight=10.0),
             #oks_cost=dict(type='opera.OksCost', weight=7.0))),
             oks_cost=dict(type='opera.OksCost', weight=0.0))),
     test_cfg=dict(max_per_img=100))
@@ -267,9 +248,9 @@ optimizer = dict(
             reference_points=dict(lr_mult=0.1))))
 optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2)) # max_norm=0.1 1.0
 lr_config = dict(policy='step', step=[400]) #400
-runner = dict(type='EpochBasedRunner', max_epochs=60) #450
+runner = dict(type='EpochBasedRunner', max_epochs=450) #450
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_stage1_token'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_baseline_test_recover'
 auto_resume = False
 #gpu_ids = range(0, 3)
 gpu_ids = range(0, 1)

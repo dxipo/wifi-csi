@@ -36,7 +36,6 @@ class PETR(DETR):
                       gt_labels,
                       gt_keypoints,
                       gt_areas,
-                      gt_token=None,  # ✅ 新增
                       gt_bboxes_ignore=None):
         """
         Args:
@@ -65,21 +64,9 @@ class PETR(DETR):
         bs, _, _, _, channel = img.shape
         x = img.reshape(bs, -1, channel)
         x = self.head(x)
-        # losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
-        #                                       gt_labels, gt_keypoints,
-        #                                       gt_areas, gt_bboxes_ignore,gt_token=gt_token)# ✅ 关键：传进去
-
-        losses = self.bbox_head.forward_train(
-            x,
-            img_metas,
-            gt_bboxes,
-            gt_labels=gt_labels,
-            gt_keypoints=gt_keypoints,
-            gt_areas=gt_areas,
-            gt_token=gt_token,
-            gt_bboxes_ignore=gt_bboxes_ignore
-        )
-
+        losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
+                                              gt_labels, gt_keypoints,
+                                              gt_areas, gt_bboxes_ignore)
         return losses
 
     def forward_dummy(self, img):
