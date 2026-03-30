@@ -38,6 +38,12 @@ data = dict(
     train=dict(
         type='opera.WifiPoseDataset',
         dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out',
+        use_stft=True,
+        stft_cfg=dict(
+            nperseg=8,
+            noverlap=4,
+            nfft=16
+        ),
         pipeline=[
             dict(
                 type='opera.DefaultFormatBundle',
@@ -53,6 +59,12 @@ data = dict(
     val=dict(
         type='opera.WifiPoseDataset',
         dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out',
+        use_stft=True,
+        stft_cfg=dict(
+            nperseg=8,
+            noverlap=4,
+            nfft=16
+        ),
         pipeline=[
             dict(
                 type='mmdet.MultiScaleFlipAug',
@@ -69,6 +81,12 @@ data = dict(
     test=dict(
         type='opera.WifiPoseDataset',
         dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out',
+        use_stft=True,
+        stft_cfg=dict(
+            nperseg=8,
+            noverlap=4,
+            nfft=16
+        ),
         pipeline=[
             dict(
                 type='mmdet.MultiScaleFlipAug',
@@ -113,6 +131,7 @@ mp_start_method = 'fork'
 auto_scale_lr = dict(enable=False, base_batch_size=16)
 model = dict(
     type='opera.PETR',
+    input_dim=9,
     backbone=dict(
         type='mmdet.ResNet',
         depth=50,
@@ -250,7 +269,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2)) # max_norm=0.
 lr_config = dict(policy='step', step=[400]) #400
 runner = dict(type='EpochBasedRunner', max_epochs=450) #450
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_baseline_test_recover'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/wifipose_2d_baseline_STFT'
 auto_resume = False
 #gpu_ids = range(0, 3)
 gpu_ids = range(0, 1)

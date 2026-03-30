@@ -1,5 +1,6 @@
 # Copyright (c) Hikvision Research Institute. All rights reserved.
 import mmcv
+import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -21,11 +22,12 @@ class PETR(DETR):
     """Implementation of `End-to-End Multi-Person Pose Estimation with
     Transformers`"""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, input_dim=60, **kwargs):
+        self.input_dim = input_dim
         super(DETR, self).__init__(*args, **kwargs)
-        #---------------------
-        self.head = Linear(60, 256)
-        
+        # ---------------------
+        self.head = Linear(self.input_dim, 256)
+
         #--------only amp
         #self.head = Linear(30, 256)
         
@@ -60,13 +62,22 @@ class PETR(DETR):
             dict[str, Tensor]: A dictionary of loss components.
         """
         super(SingleStageDetector, self).forward_train(img, img_metas)
-        # x = self.extract_feat(img)
-        bs, _, _, _, channel = img.shape
-        x = img.reshape(bs, -1, channel)
+
+        # img expected shape: (B, *, *, *, D), use last dim as feature dim
+        bs = img.shape[0]
+        feature_dim = img.shape[-1]
+
+        assert feature_dim == self.input_dim, \
+            f"input feature dim mismatch: got {feature_dim}, expect {self.input_dim}"
+
+        x = img.reshape(bs, -1, feature_dim)
         x = self.head(x)
-        losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
-                                              gt_labels, gt_keypoints,
-                                              gt_areas, gt_bboxes_ignore)
+
+        losses = self.bbox_head.forward_train(
+            x, img_metas, gt_bboxes,
+            gt_labels, gt_keypoints,
+            gt_areas, gt_bboxes_ignore
+        )
         return losses
 
     def forward_dummy(self, img):
@@ -108,9 +119,14 @@ class PETR(DETR):
         batch_size = len(img_metas)
         assert batch_size == 1, 'Currently only batch_size 1 for inference ' \
             f'mode is supported. Found batch_size {batch_size}.'
-        
-        bs, _, _, _, channel = img.shape
-        x = img.reshape(bs, -1, channel)
+
+        bs = img.shape[0]
+        feature_dim = img.shape[-1]
+
+        assert feature_dim == self.input_dim, \
+            f"input feature dim mismatch: got {feature_dim}, expect {self.input_dim}"
+
+        x = img.reshape(bs, -1, feature_dim)
         feat = self.head(x)
         results_list = self.bbox_head.simple_test(
             feat, img_metas, rescale=rescale)

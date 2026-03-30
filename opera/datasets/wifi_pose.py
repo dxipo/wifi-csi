@@ -6,6 +6,7 @@ from torch.utils.data import Dataset as dataset
 import pywt
 from collections import OrderedDict
 import scipy.fft as fft
+from scipy.signal import stft
 from .builder import DATASETS
 from mmdet.datasets.pipelines import Compose
 import h5py
@@ -19,6 +20,11 @@ class WifiPoseDataset(dataset):
         self.img_dir = ''  # 你这里没有rgb图像路径，但pipeline可能会读 img_prefix
         self.debug = kwargs.get('debug', False)
         self._dbg_printed = False
+        self.use_stft = kwargs.get('use_stft', False)
+        self.stft_cfg = kwargs.get(
+            'stft_cfg',
+            dict(nperseg=8, noverlap=4, nfft=16)
+        )
         self.pipeline = Compose(pipeline)
         self.filename_list = self.load_file_name_list(os.path.join(self.data_root, mode + '_data_list.txt'))
         self._set_group_flag()
@@ -54,18 +60,17 @@ class WifiPoseDataset(dataset):
         csi_phd = torch.FloatTensor(csi_phd).permute(0,1,3,2)'''
         
         #-------------------
-        csi_amp = self.dwt_amp(csi)
-        csi_ph = self.phase_deno(csi)
-        csi_ph = np.angle(csi_ph)
-        #csi = np.concatenate((csi_amp, csi_ph), axis=2)
-        csi = np.concatenate((csi_amp, csi_ph), axis=2)
-        #csi = torch.FloatTensor(csi)
-        
-        '''csi_amp = self.dwt_amp(csi)
-        csi = torch.FloatTensor(csi_amp)'''
-        
-        #csi = torch.cat((csi_amp, csi_ph), 2)
-        csi = torch.FloatTensor(csi).permute(0,1,3,2)
+        # -------------------
+        if self.use_stft:
+            # STFT baseline: only use amplitude
+            csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
+            csi = torch.FloatTensor(csi)
+        else:
+            csi_amp = self.dwt_amp(csi)
+            csi_ph = self.phase_deno(csi)
+            csi_ph = np.angle(csi_ph)
+            csi = np.concatenate((csi_amp, csi_ph), axis=2)
+            csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
         
 
         #keypoint = np.array(np.load(keypoint_path))
@@ -119,6 +124,10 @@ class WifiPoseDataset(dataset):
             print("[wifi_pose] img:", csi.shape, "kpt:", keypoint.shape,
                   "kpt_minmax_xy:", keypoint[..., :2].min().item(), keypoint[..., :2].max().item())
 
+        # if self.debug and (not self._dbg_printed):
+        #     print("[wifi_pose] img:", csi.shape, "kpt:", keypoint.shape,
+        #           "kpt_minmax_xy:", keypoint[..., :2].min().item(), keypoint[..., :2].max().item())
+
         # --- END ADD ---
 
         # ---- ADD: load teacher token ----
@@ -134,6 +143,12 @@ class WifiPoseDataset(dataset):
             print("[wifi_pose] token:", gt_token.shape, gt_token.dtype, "min/max:", gt_token.min().item(),
                   gt_token.max().item())
         #dis
+
+        # if self.debug and (not self._dbg_printed):
+        #     print("[wifi_pose] token:", gt_token.shape, gt_token.dtype, "min/max:",
+        #           gt_token.min().item(), gt_token.max().item())
+        #     self._dbg_printed = True
+
 
         numOfPerson = keypoint.shape[0]
         # gt_labels = np.zeros(numOfPerson, dtype=np.int64) #label (N,)
@@ -278,7 +293,57 @@ class WifiPoseDataset(dataset):
         list = pywt.wavedec(abs(csi), w,'sym')
         csi_amp = pywt.waverec(list, w)
         return csi_amp
-        
+
+    def stft_amp(self, csi):
+        """
+        对 amplitude 做 STFT
+        input:
+            csi: complex ndarray, shape (3, 3, 30, 20)
+
+        output:
+            stft feature, shape (3, 3, 30, Tbin, F)
+            最后一维 F 作为 feature dim，其余维度会在 detector 里展平成 token 维
+        """
+        amp = np.abs(csi).astype(np.float32)  # (3,3,30,20)
+
+        nperseg = self.stft_cfg.get('nperseg', 8)
+        noverlap = self.stft_cfg.get('noverlap', 4)
+        nfft = self.stft_cfg.get('nfft', 16)
+
+        out = []
+        for rx in range(3):
+            rx_list = []
+            for tx in range(3):
+                sc_list = []
+                for sc in range(30):
+                    seq = amp[rx, tx, sc]  # (20,)
+
+                    f, t, Zxx = stft(
+                        seq,
+                        nperseg=nperseg,
+                        noverlap=noverlap,
+                        nfft=nfft,
+                        boundary=None,
+                        padded=False
+                    )
+
+                    spec = np.abs(Zxx).astype(np.float32)  # (F, Tbin)
+                    spec = np.log1p(spec)  # 数值更稳
+
+                    # 转成 (Tbin, F)，让最后一维 F 作为 feature dim
+                    spec = spec.transpose(1, 0)  # (Tbin, F)
+                    sc_list.append(spec)
+
+                sc_list = np.stack(sc_list, axis=0)  # (30, Tbin, F)
+                rx_list.append(sc_list)
+
+            rx_list = np.stack(rx_list, axis=0)  # (3, 30, Tbin, F)
+            out.append(rx_list)
+
+        out = np.stack(out, axis=0)  # (3, 3, 30, Tbin, F)
+        return out
+
+
     def keypoint_process(self, keypoints):
         next_point = np.array([[0,1], [1,2], [2,5], [3,0], [4,2], [5,7],
                                [6,3], [7,3], [8,4], [9,5], [10,6], [11,7],
