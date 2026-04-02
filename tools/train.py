@@ -24,8 +24,6 @@ from opera.apis import init_random_seed, set_random_seed, train_model
 from opera.datasets import build_dataset
 from opera.models import build_model
 
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a model')
     parser.add_argument('config', help='train config file path')
@@ -58,7 +56,7 @@ def parse_args():
         default=0,
         help='id of gpu to use '
         '(only applicable to non-distributed training)')
-    parser.add_argument('--seed', type=int, default=None, help='random seed')
+    parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument(
         '--diff-seed',
         action='store_true',
@@ -95,6 +93,7 @@ def parse_args():
         action='store_true',
         help='enable automatically scaling LR.')
     args = parser.parse_args()
+    args.deterministic = True
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
 
