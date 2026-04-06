@@ -20,6 +20,11 @@ class WifiPoseDataset(dataset):
         self.img_dir = ''  # 你这里没有rgb图像路径，但pipeline可能会读 img_prefix
         self.debug = kwargs.get('debug', False)
         self._dbg_printed = False
+
+        self.use_offline_stft = kwargs.get('use_offline_stft', False)
+        self.offline_stft_dir = kwargs.get('offline_stft_dir', 'csi_stft_offline')
+        self.offline_stft_ext = kwargs.get('offline_stft_ext', '.npy')
+
         self.use_stft = kwargs.get('use_stft', False)
         self.stft_cfg = kwargs.get(
             'stft_cfg',
@@ -61,7 +66,7 @@ class WifiPoseDataset(dataset):
         
         #-------------------
         # -------------------
-        if self.use_stft:
+        if self.use_offline_stft:
             # STFT baseline: only use amplitude
             csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
             csi = torch.FloatTensor(csi)
@@ -176,30 +181,41 @@ class WifiPoseDataset(dataset):
     
     def get_item_single_frame_limit(self,index): 
         data_name = self.filename_list[index]
-        csi_path = os.path.join(self.data_root,'csi',(str(data_name)+'.mat'))
-        keypoint_path = os.path.join(self.data_root,'keypoint',(str(data_name)+'.npy'))
-        
-        csi =  io.loadmat(csi_path)['csi_out']
-        csi = np.array(csi)
-        csi = csi.astype(np.complex128)
-        
-        '''csi_amp = abs(csi)
-        csi_amp = torch.FloatTensor(csi_amp).permute(0,1,3,2) #csi tensor: (3*3*30*20 -> 3*3*20*30)
-        
-        csi_ph = np.unwrap(np.angle(csi))
-        csi_ph = fft.ifft(csi_ph)
-        csi_phd = csi_ph[:,:,:,1:20] - csi_ph[:,:,:,0:19]
-        csi_phd = torch.FloatTensor(csi_phd).permute(0,1,3,2)'''
-        
-        
-        csi_amp = self.dwt_amp(csi)
-        csi_ph = self.phase_deno(csi)
-        csi_ph = np.angle(csi_ph)
-        #csi = np.concatenate((csi_amp, csi_ph), axis=2)
-        #csi = torch.cat((csi_amp, csi_ph), 2)
-        csi = torch.FloatTensor(csi).permute(0,1,3,2)
-        #csi = np.concatenate((csi_amp, csi_ph), axis=3)
-        #csi = torch.FloatTensor(csi)
+        if self.use_offline_stft:
+            csi_path = os.path.join(
+                self.data_root,
+                self.offline_stft_dir,
+                data_name + self.offline_stft_ext
+            )
+
+            if self.offline_stft_ext == '.npy':
+                csi = np.load(csi_path).astype(np.float32)
+            elif self.offline_stft_ext == '.npz':
+                csi = np.load(csi_path)['csi_feature'].astype(np.float32)
+            elif self.offline_stft_ext == '.mat':
+                with h5py.File(csi_path, 'r') as f:
+                    csi = np.array(f['csi_feature']).astype(np.float32)
+            else:
+                raise ValueError(f'Unsupported offline_stft_ext={self.offline_stft_ext}')
+
+            csi = torch.FloatTensor(csi)
+
+        else:
+            csi_path = os.path.join(self.data_root, 'csi', data_name + '.mat')
+            csi = h5py.File(csi_path)['csi_out']
+            csi = np.array(csi).transpose(3, 2, 1, 0)
+            csi = csi.astype(np.complex128)
+
+            if self.use_stft:
+                csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
+                csi = torch.FloatTensor(csi)
+            else:
+                csi_amp = self.dwt_amp(csi)
+                csi_ph = self.phase_deno(csi)
+                csi_ph = np.angle(csi_ph)
+                csi = np.concatenate((csi_amp, csi_ph), axis=2)
+                csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
+                print('offline csi shape:', csi.shape)
         
 
         keypoint = np.array(np.load(keypoint_path))
