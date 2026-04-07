@@ -71,11 +71,12 @@ class WifiPoseDataset(dataset):
             csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
             csi = torch.FloatTensor(csi)
         else:
-            csi_amp = self.dwt_amp(csi)
-            csi_ph = self.phase_deno(csi)
-            csi_ph = np.angle(csi_ph)
-            csi = np.concatenate((csi_amp, csi_ph), axis=2)
-            csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
+            csi = self._load_csi_feature(data_name)
+            # csi_amp = self.dwt_amp(csi)
+            # csi_ph = self.phase_deno(csi)
+            # csi_ph = np.angle(csi_ph)
+            # csi = np.concatenate((csi_amp, csi_ph), axis=2)
+            # csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
         
 
         #keypoint = np.array(np.load(keypoint_path))
@@ -179,15 +180,61 @@ class WifiPoseDataset(dataset):
         #result = dict(img=csi, gt_keypoints=keypoint, gt_labels = gt_labels, gt_bboxes = gt_bboxes, gt_areas = gt_areas, gt_token = gt_token, img_name = data_name, img_shape=(360, 640, 3))
         return result
     
-    def get_item_single_frame_limit(self,index): 
-        data_name = self.filename_list[index]
+    # def get_item_single_frame_limit(self,index):
+    #     data_name = self.filename_list[index]
+    #     if self.use_offline_stft:
+    #         csi_path = os.path.join(
+    #             self.data_root,
+    #             self.offline_stft_dir,
+    #             data_name + self.offline_stft_ext
+    #         )
+    #
+    #         if self.offline_stft_ext == '.npy':
+    #             csi = np.load(csi_path).astype(np.float32)
+    #         elif self.offline_stft_ext == '.npz':
+    #             csi = np.load(csi_path)['csi_feature'].astype(np.float32)
+    #         elif self.offline_stft_ext == '.mat':
+    #             with h5py.File(csi_path, 'r') as f:
+    #                 csi = np.array(f['csi_feature']).astype(np.float32)
+    #         else:
+    #             raise ValueError(f'Unsupported offline_stft_ext={self.offline_stft_ext}')
+    #
+    #         csi = torch.FloatTensor(csi)
+    #
+    #     else:
+    #         csi_path = os.path.join(self.data_root, 'csi', data_name + '.mat')
+    #         csi = h5py.File(csi_path)['csi_out']
+    #         csi = np.array(csi).transpose(3, 2, 1, 0)
+    #         csi = csi.astype(np.complex128)
+    #
+    #         if self.use_stft:
+    #             csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
+    #             csi = torch.FloatTensor(csi)
+    #         else:
+    #             csi_amp = self.dwt_amp(csi)
+    #             csi_ph = self.phase_deno(csi)
+    #             csi_ph = np.angle(csi_ph)
+    #             csi = np.concatenate((csi_amp, csi_ph), axis=2)
+    #             csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
+    #             print('offline csi shape:', csi.shape)
+    #
+    #
+    #     keypoint = np.array(np.load(keypoint_path))
+    #     #keypoint = self.keypoint_process(keypoint)
+    #     keypoint = torch.FloatTensor(keypoint) # keypoint tensor: (N*14*3)
+    #
+    #     numOfPerson = keypoint.shape[0]
+    #     gt_labels = np.zeros(numOfPerson, dtype=np.int64) #label (N,)
+    #     gt_bboxes = torch.tensor([])
+    #     gt_areas = torch.tensor([])
+    #     result = dict(img=csi, gt_keypoints=keypoint, gt_labels = gt_labels, gt_bboxes = gt_bboxes, gt_areas = gt_areas )
+    #     return result
+
+    def _load_csi_feature(self, data_name):
         if self.use_offline_stft:
             csi_path = os.path.join(
-                self.data_root,
-                self.offline_stft_dir,
-                data_name + self.offline_stft_ext
+                self.data_root, self.offline_stft_dir, data_name + self.offline_stft_ext
             )
-
             if self.offline_stft_ext == '.npy':
                 csi = np.load(csi_path).astype(np.float32)
             elif self.offline_stft_ext == '.npz':
@@ -197,37 +244,23 @@ class WifiPoseDataset(dataset):
                     csi = np.array(f['csi_feature']).astype(np.float32)
             else:
                 raise ValueError(f'Unsupported offline_stft_ext={self.offline_stft_ext}')
+            return torch.FloatTensor(csi)
 
-            csi = torch.FloatTensor(csi)
+        csi_path = os.path.join(self.data_root, 'csi', data_name + '.mat')
+        with h5py.File(csi_path, 'r') as f:
+            csi = f['csi_out'][()]
+        csi = csi['real'] + csi['imag'] * 1j
+        csi = np.array(csi).transpose(3, 2, 1, 0).astype(np.complex128)
 
-        else:
-            csi_path = os.path.join(self.data_root, 'csi', data_name + '.mat')
-            csi = h5py.File(csi_path)['csi_out']
-            csi = np.array(csi).transpose(3, 2, 1, 0)
-            csi = csi.astype(np.complex128)
+        if self.use_stft:
+            csi = self.stft_amp(csi)
+            return torch.FloatTensor(csi)
 
-            if self.use_stft:
-                csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
-                csi = torch.FloatTensor(csi)
-            else:
-                csi_amp = self.dwt_amp(csi)
-                csi_ph = self.phase_deno(csi)
-                csi_ph = np.angle(csi_ph)
-                csi = np.concatenate((csi_amp, csi_ph), axis=2)
-                csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
-                print('offline csi shape:', csi.shape)
-        
-
-        keypoint = np.array(np.load(keypoint_path))
-        #keypoint = self.keypoint_process(keypoint)
-        keypoint = torch.FloatTensor(keypoint) # keypoint tensor: (N*14*3)
-
-        numOfPerson = keypoint.shape[0]
-        gt_labels = np.zeros(numOfPerson, dtype=np.int64) #label (N,)
-        gt_bboxes = torch.tensor([])
-        gt_areas = torch.tensor([])
-        result = dict(img=csi, gt_keypoints=keypoint, gt_labels = gt_labels, gt_bboxes = gt_bboxes, gt_areas = gt_areas )
-        return result
+        csi_amp = self.dwt_amp(csi)
+        csi_ph = self.phase_deno(csi)
+        csi_ph = np.angle(csi_ph)
+        csi = np.concatenate((csi_amp, csi_ph), axis=2)
+        return torch.FloatTensor(csi).permute(0, 1, 3, 2)
     
     def __getitem__(self, index):
         result = self.get_item_single_frame(index)
