@@ -50,7 +50,7 @@ CONFIG = {
 
     # ---------- SDP 参数 ----------
     "lag_step": 1,
-    "n_delta": 6,v
+    "n_delta": 6,
 
     # 输出 layout:
     #   "nwt" -> (Rx, Tx, NΔ, WT)

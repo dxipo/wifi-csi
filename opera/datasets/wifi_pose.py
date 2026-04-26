@@ -21,15 +21,10 @@ class WifiPoseDataset(dataset):
         self.debug = kwargs.get('debug', False)
         self._dbg_printed = False
 
-        self.use_offline_stft = kwargs.get('use_offline_stft', False)
-        self.offline_stft_dir = kwargs.get('offline_stft_dir', 'csi_stft_offline')
-        self.offline_stft_ext = kwargs.get('offline_stft_ext', '.npy')
+        self.offline_sdp_dir = kwargs.get('offline_sdp_dir', 'csi_sdp_offline')
+        self.offline_sdp_ext = kwargs.get('offline_sdp_ext', '.npy')
+        self.sdp_layout = kwargs.get('sdp_layout', 'wtn')  # 'wtn' or 'nwt'
 
-        self.use_stft = kwargs.get('use_stft', False)
-        self.stft_cfg = kwargs.get(
-            'stft_cfg',
-            dict(nperseg=8, noverlap=4, nfft=16)
-        )
         self.pipeline = Compose(pipeline)
         self.filename_list = self.load_file_name_list(os.path.join(self.data_root, mode + '_data_list.txt'))
         self._set_group_flag()
@@ -38,51 +33,13 @@ class WifiPoseDataset(dataset):
         results['seg_fields'] = []
         results['img_prefix'] = self.img_dir
 
-    def get_item_single_frame(self,index): 
+    def get_item_single_frame(self,index):
         data_name = self.filename_list[index]
-        csi_path = os.path.join(self.data_root,'csi',(str(data_name)+'.mat'))
-        keypoint_path = os.path.join(self.data_root,'keypoint',(str(data_name)+'.npy'))
-        token_path = os.path.join(self.data_root, 'token', (str(data_name) + '.npy')) #dis
-        
-        '''csi =  io.loadmat(csi_path)['csi_out']
-        csi = np.array(csi)
-        csi = csi.astype(np.complex128)'''
-        
-        #csi = h5py.File(csi_path)['csi_out'].value
-        #csi = h5py.File(csi_path)['csi_out'][()] # by po
-        with h5py.File(csi_path, 'r') as f:
-            csi = f['csi_out'][()]  # structured array: real/imag
-        csi = csi['real'] + csi['imag']*1j
-        csi = np.array(csi).transpose(3,2,1,0)
-        csi = csi.astype(np.complex128)
-        
-        '''csi_amp = abs(csi)
-        csi_amp = torch.FloatTensor(csi_amp).permute(0,1,3,2) #csi tensor: (3*3*30*20 -> 3*3*20*30)
-        
-        csi_ph = np.unwrap(np.angle(csi))
-        csi_ph = fft.ifft(csi_ph)
-        csi_phd = csi_ph[:,:,:,1:20] - csi_ph[:,:,:,0:19]
-        csi_phd = torch.FloatTensor(csi_phd).permute(0,1,3,2)'''
-        
-        #-------------------
-        # -------------------
-        if self.use_offline_stft:
-            # STFT baseline: only use amplitude
-            csi = self.stft_amp(csi)  # (3,3,30,Tbin,F)
-            csi = torch.FloatTensor(csi)
-        else:
-            csi = self._load_csi_feature(data_name)
-            # csi_amp = self.dwt_amp(csi)
-            # csi_ph = self.phase_deno(csi)
-            # csi_ph = np.angle(csi_ph)
-            # csi = np.concatenate((csi_amp, csi_ph), axis=2)
-            # csi = torch.FloatTensor(csi).permute(0, 1, 3, 2)
-        
+        keypoint_path = os.path.join(self.data_root, 'keypoint', str(data_name) + '.npy')
+        token_path = os.path.join(self.data_root, 'token', str(data_name) + '.npy')
 
-        #keypoint = np.array(np.load(keypoint_path))
+        csi = self._load_csi_feature(data_name)
 
-        #keypoint = self.keypoint_process(keypoint)
-        #keypoint = torch.FloatTensor(keypoint) # keypoint tensor: (N*14*3)
         keypoint_raw = torch.from_numpy(np.load(keypoint_path)).float()  # (N,14,3) or (N,14,2)
 
         keypoint_xy = keypoint_raw[..., :2]  # (N,14,2)
@@ -100,31 +57,6 @@ class WifiPoseDataset(dataset):
 
         assert keypoint.ndim == 3 and keypoint.shape[1] == 14 and keypoint.shape[2] == 3, \
             f"bad keypoint shape: {keypoint.shape}"
-
-
-
-        # keypoint = torch.FloatTensor(np.load(keypoint_path))  # (N,14,3) or (N,14,2)
-        # # 只取 x,y
-        # keypoint_xy = keypoint[..., :2]
-        #
-        # W, H = 640.0, 360.0
-        # keypoint_xy[..., 0] = keypoint_xy[..., 0] / W
-        # keypoint_xy[..., 1] = keypoint_xy[..., 1] / H
-        #
-        # # clamp 防止越界
-        # keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
-        # keypoint = keypoint_xy  # (N,14,2)
-        #
-        #
-        # #keypoint[..., 2] = 1.0
-        #
-        # # --- ADD: sanity check ---
-        # assert keypoint.ndim == 3 and keypoint.shape[1] == 14, f"bad keypoint shape: {keypoint.shape}"
-        # assert keypoint.shape[2] >= 2, f"need at least (x,y): {keypoint.shape}"
-        # # 允许你是(14,3)或(14,2)，如果是(14,2)就补一维0，保证后面代码统一
-        # if keypoint.shape[2] == 2:
-        #     pad = torch.zeros(keypoint.shape[0], 14, 1, dtype=keypoint.dtype)
-        #     keypoint = torch.cat([keypoint, pad], dim=2)
 
         if index < 3:
             print("[wifi_pose] img:", csi.shape, "kpt:", keypoint.shape,
@@ -231,37 +163,25 @@ class WifiPoseDataset(dataset):
     #     return result
 
     def _load_csi_feature(self, data_name):
-        if self.use_offline_stft:
-            csi_path = os.path.join(
-                self.data_root, self.offline_stft_dir, data_name + self.offline_stft_ext
-            )
-            if self.offline_stft_ext == '.npy':
-                csi = np.load(csi_path).astype(np.float32)
-            elif self.offline_stft_ext == '.npz':
-                csi = np.load(csi_path)['csi_feature'].astype(np.float32)
-            elif self.offline_stft_ext == '.mat':
-                with h5py.File(csi_path, 'r') as f:
-                    csi = np.array(f['csi_feature']).astype(np.float32)
-            else:
-                raise ValueError(f'Unsupported offline_stft_ext={self.offline_stft_ext}')
-            return torch.FloatTensor(csi)
+        csi_path = os.path.join(
+            self.data_root,
+            self.offline_sdp_dir,
+            data_name + self.offline_sdp_ext
+        )
 
-        csi_path = os.path.join(self.data_root, 'csi', data_name + '.mat')
-        with h5py.File(csi_path, 'r') as f:
-            csi = f['csi_out'][()]
-        csi = csi['real'] + csi['imag'] * 1j
-        csi = np.array(csi).transpose(3, 2, 1, 0).astype(np.complex128)
+        csi = np.load(csi_path).astype(np.float32)
 
-        if self.use_stft:
-            csi = self.stft_amp(csi)
-            return torch.FloatTensor(csi)
+        # 保存时如果是 (3,3,NΔ,WT)，这里转成 (3,3,WT,NΔ)
+        if self.sdp_layout == 'nwt':
+            csi = np.transpose(csi, (0, 1, 3, 2))
+        elif self.sdp_layout == 'wtn':
+            pass
+        else:
+            raise ValueError(f'Unsupported sdp_layout={self.sdp_layout}')
 
-        csi_amp = self.dwt_amp(csi)
-        csi_ph = self.phase_deno(csi)
-        csi_ph = np.angle(csi_ph)
-        csi = np.concatenate((csi_amp, csi_ph), axis=2)
-        return torch.FloatTensor(csi).permute(0, 1, 3, 2)
-    
+        return torch.FloatTensor(csi)
+
+
     def __getitem__(self, index):
         result = self.get_item_single_frame(index)
         self.pre_pipeline(result)  # <<<<<< 新增
