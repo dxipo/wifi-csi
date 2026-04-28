@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple
 
@@ -42,8 +43,8 @@ from tqdm import tqdm
 EPS = 1e-8
 
 CONFIG = {
-    "src_root": "/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out",
-    "dst_root": "/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out_sdp_offline_power_xfall",
+    "src_root": "/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out",
+    "dst_root": "/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out_sdp_offline_power_xfall",
     "src_csi_dir": "csi",
     "dst_csi_dir": "csi_sdp_offline",
     "input_ext": ".mat",
@@ -76,6 +77,9 @@ CONFIG = {
     "save_preview_stats": True,
     "preview_dir": "preview_sdp",
     "save_preview_grid": True,
+
+    "num_workers": 8,
+    "parallel_chunksize": 32,
 }
 
 
@@ -425,6 +429,22 @@ def save_array(path: Path, arr: np.ndarray, dtype: str) -> None:
     np.save(path, arr)
 
 
+def process_one_file_worker(args: Tuple[str, str, dict]) -> str:
+    path_str, dst_csi_root_str, cfg = args
+    path = Path(path_str)
+    dst_csi_root = Path(dst_csi_root_str)
+    out_path = dst_csi_root / f"{path.stem}.npy"
+
+    if out_path.exists() and not cfg["overwrite"]:
+        return "skipped"
+
+    csi = load_csi_from_mat(str(path), mat_key=cfg["mat_key"])
+    validate_canonical_shape(csi, cfg)
+    sdp, _, _ = extract_sdp_from_csi(csi, cfg)
+    save_array(out_path, sdp, dtype=cfg["dtype"])
+    return "processed"
+
+
 def process_dataset(cfg: dict) -> None:
     src_root = Path(cfg["src_root"])
     dst_root = Path(cfg["dst_root"])
@@ -463,26 +483,28 @@ def process_dataset(cfg: dict) -> None:
     print("zero_column_fill:", cfg["zero_column_fill"])
     print("overwrite       :", cfg["overwrite"])
     print("preview_limit   :", cfg["preview_limit"])
+    print("num_workers     :", cfg["num_workers"])
     print("num files       :", len(files))
     print("=" * 78)
 
     preview_count = 0
     preview_paths: List[Path] = []
+    parallel_files: List[Path] = []
 
-    for path in tqdm(files, desc="SDP preprocessing"):
+    for path in tqdm(files, desc="SDP preprocessing preview/scan"):
         out_path = dst_csi_root / f"{path.stem}.npy"
         if out_path.exists() and not cfg["overwrite"]:
             continue
 
-        csi = load_csi_from_mat(str(path), mat_key=cfg["mat_key"])
-        validate_canonical_shape(csi, cfg)
-        sdp, amp_processed, power_response = extract_sdp_from_csi(csi, cfg)
-        save_array(out_path, sdp, dtype=cfg["dtype"])
-
-        if cfg["save_preview_stats"] and preview_count < cfg["preview_limit"]:
-            print_sample_stats(path.name, sdp, cfg)
-
         if preview_count < cfg["preview_limit"]:
+            csi = load_csi_from_mat(str(path), mat_key=cfg["mat_key"])
+            validate_canonical_shape(csi, cfg)
+            sdp, amp_processed, power_response = extract_sdp_from_csi(csi, cfg)
+            save_array(out_path, sdp, dtype=cfg["dtype"])
+
+            if cfg["save_preview_stats"]:
+                print_sample_stats(path.name, sdp, cfg)
+
             preview_path = plot_preview_sample(
                 sample_name=path.name,
                 raw_csi=csi,
@@ -494,6 +516,29 @@ def process_dataset(cfg: dict) -> None:
             )
             preview_paths.append(preview_path)
             preview_count += 1
+        else:
+            parallel_files.append(path)
+
+    if parallel_files:
+        num_workers = min(max(1, int(cfg["num_workers"])), len(parallel_files))
+        tasks = [(str(path), str(dst_csi_root), cfg) for path in parallel_files]
+
+        if num_workers == 1:
+            iterator = map(process_one_file_worker, tasks)
+        else:
+            executor = ProcessPoolExecutor(max_workers=num_workers)
+            iterator = executor.map(
+                process_one_file_worker,
+                tasks,
+                chunksize=max(1, int(cfg["parallel_chunksize"])),
+            )
+
+        try:
+            for _ in tqdm(iterator, total=len(tasks), desc="SDP preprocessing parallel"):
+                pass
+        finally:
+            if num_workers > 1:
+                executor.shutdown(wait=True)
 
     if cfg["save_preview_grid"] and preview_paths:
         try:
