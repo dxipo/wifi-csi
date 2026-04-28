@@ -4,6 +4,7 @@ import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch import nn
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon, Circle
 from mmdet.core.visualization import color_val_matplotlib
@@ -22,14 +23,63 @@ class PETR(DETR):
     """Implementation of `End-to-End Multi-Person Pose Estimation with
     Transformers`"""
 
-    def __init__(self, *args, input_dim=60, **kwargs):
+    def __init__(self,
+                 *args,
+                 input_dim=60,
+                 input_adapter='linear',
+                 patch_kernel_size=(3, 25),
+                 patch_stride=None,
+                 patch_padding=0,
+                 patch_out_dim=256,
+                 **kwargs):
         self.input_dim = input_dim
+        self.input_adapter = input_adapter
         super(DETR, self).__init__(*args, **kwargs)
-        # ---------------------
-        self.head = Linear(self.input_dim, 256)
+        if self.input_adapter == 'linear':
+            self.head = Linear(self.input_dim, 256)
+        elif self.input_adapter == 'conv_patch':
+            if patch_stride is None:
+                patch_stride = patch_kernel_size
+            self.patch_embed = nn.Sequential(
+                nn.Conv2d(
+                    self.input_dim,
+                    patch_out_dim,
+                    kernel_size=tuple(patch_kernel_size),
+                    stride=tuple(patch_stride),
+                    padding=patch_padding),
+                nn.BatchNorm2d(patch_out_dim),
+                nn.ReLU(inplace=True))
+            self.head = nn.Identity()
+        else:
+            raise ValueError(f'Unsupported input_adapter={self.input_adapter}')
 
         #--------only amp
         #self.head = Linear(30, 256)
+
+    def _extract_token_features(self, img):
+        if self.input_adapter == 'linear':
+            bs = img.shape[0]
+            feature_dim = img.shape[-1]
+            assert feature_dim == self.input_dim, \
+                f"input feature dim mismatch: got {feature_dim}, expect {self.input_dim}"
+            x = img.reshape(bs, -1, feature_dim)
+            return self.head(x)
+
+        if self.input_adapter == 'conv_patch':
+            assert img.ndim == 4, \
+                f"conv_patch expects 4D image-like input, got shape {tuple(img.shape)}"
+            if img.shape[-1] == self.input_dim:
+                img = img.permute(0, 3, 1, 2).contiguous()
+            elif img.shape[1] == self.input_dim:
+                img = img.contiguous()
+            else:
+                raise AssertionError(
+                    f"conv_patch channel mismatch: got shape {tuple(img.shape)}, "
+                    f"expect last or second dim to be {self.input_dim}")
+            feat = self.patch_embed(img)
+            return feat.flatten(2).transpose(1, 2).contiguous()
+
+        raise ValueError(f'Unsupported input_adapter={self.input_adapter}')
         
     def forward_train(self,
                       img,
@@ -63,15 +113,7 @@ class PETR(DETR):
         """
         super(SingleStageDetector, self).forward_train(img, img_metas)
 
-        # img expected shape: (B, *, *, *, D), use last dim as feature dim
-        bs = img.shape[0]
-        feature_dim = img.shape[-1]
-
-        assert feature_dim == self.input_dim, \
-            f"input feature dim mismatch: got {feature_dim}, expect {self.input_dim}"
-
-        x = img.reshape(bs, -1, feature_dim)
-        x = self.head(x)
+        x = self._extract_token_features(img)
 
         losses = self.bbox_head.forward_train(
             x, img_metas, gt_bboxes,
@@ -120,14 +162,7 @@ class PETR(DETR):
         assert batch_size == 1, 'Currently only batch_size 1 for inference ' \
             f'mode is supported. Found batch_size {batch_size}.'
 
-        bs = img.shape[0]
-        feature_dim = img.shape[-1]
-
-        assert feature_dim == self.input_dim, \
-            f"input feature dim mismatch: got {feature_dim}, expect {self.input_dim}"
-
-        x = img.reshape(bs, -1, feature_dim)
-        feat = self.head(x)
+        feat = self._extract_token_features(img)
         results_list = self.bbox_head.simple_test(
             feat, img_metas, rescale=rescale)
 

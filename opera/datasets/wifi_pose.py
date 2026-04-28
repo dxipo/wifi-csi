@@ -23,7 +23,10 @@ class WifiPoseDataset(dataset):
 
         self.offline_sdp_dir = kwargs.get('offline_sdp_dir', 'csi_sdp_offline')
         self.offline_sdp_ext = kwargs.get('offline_sdp_ext', '.npy')
-        self.sdp_layout = kwargs.get('sdp_layout', 'wtn')  # 'wtn' or 'nwt'
+        # Supported layouts:
+        # - wtn/nwt: old link-wise SDP tensors.
+        # - hwc/imagelike: image-like SDP tensors shaped (Subcarrier, Width, Antenna).
+        self.sdp_layout = kwargs.get('sdp_layout', 'wtn')
 
         self.pipeline = Compose(pipeline)
         self.filename_list = self.load_file_name_list(os.path.join(self.data_root, mode + '_data_list.txt'))
@@ -174,12 +177,12 @@ class WifiPoseDataset(dataset):
         # 保存时如果是 (3,3,NΔ,WT)，这里转成 (3,3,WT,NΔ)
         if self.sdp_layout == 'nwt':
             csi = np.transpose(csi, (0, 1, 3, 2))
-        elif self.sdp_layout == 'wtn':
+        elif self.sdp_layout in ('wtn', 'hwc', 'imagelike'):
             pass
         else:
             raise ValueError(f'Unsupported sdp_layout={self.sdp_layout}')
 
-        return torch.FloatTensor(csi)
+        return torch.FloatTensor(np.ascontiguousarray(csi))
 
 
     def __getitem__(self, index):

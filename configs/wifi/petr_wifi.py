@@ -37,10 +37,10 @@ data = dict(
     workers_per_gpu=2, #2 8
     train=dict(
         type='opera.WifiPoseDataset',
-        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out_sdp_offline_power_xfall',
-        offline_sdp_dir='csi_sdp_offline',
+        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_train_data_hold_out_sdp300_imagelike_centerctx_power_xfall',
+        offline_sdp_dir='csi_sdp300_imagelike_lagwindow_offline',
         offline_sdp_ext='.npy',
-        sdp_layout='wtn',
+        sdp_layout='hwc',
         stft_cfg=dict(
             nperseg=8,
             noverlap=4,
@@ -60,10 +60,10 @@ data = dict(
         mode='train'),
     val=dict(
         type='opera.WifiPoseDataset',
-        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out_sdp_offline_power_xfall',
-        offline_sdp_dir='csi_sdp_offline',
+        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out_sdp300_imagelike_centerctx_power_xfall',
+        offline_sdp_dir='csi_sdp300_imagelike_lagwindow_offline',
         offline_sdp_ext='.npy',
-        sdp_layout='wtn',
+        sdp_layout='hwc',
         stft_cfg=dict(
             nperseg=8,
             noverlap=4,
@@ -84,10 +84,10 @@ data = dict(
         mode='test'),
     test=dict(
         type='opera.WifiPoseDataset',
-        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out_sdp_offline_power_xfall',
-        offline_sdp_dir='csi_sdp_offline',
+        dataset_root='/home/xl/CSI/Person-in-WiFi-3D-repo/data/wifipose/all_single_test_data_hold_out_sdp300_imagelike_centerctx_power_xfall',
+        offline_sdp_dir='csi_sdp300_imagelike_lagwindow_offline',
         offline_sdp_ext='.npy',
-        sdp_layout='wtn',
+        sdp_layout='hwc',
         stft_cfg=dict(
             nperseg=8,
             noverlap=4,
@@ -137,7 +137,11 @@ mp_start_method = 'fork'
 auto_scale_lr = dict(enable=False, base_batch_size=16)
 model = dict(
     type='opera.PETR',
-    input_dim=6,
+    input_dim=3,
+    input_adapter='conv_patch',
+    patch_kernel_size=(3, 25),
+    patch_stride=(3, 25),
+    patch_out_dim=256,
     backbone=dict(
         type='mmdet.ResNet',
         depth=50,
@@ -158,7 +162,7 @@ model = dict(
         num_outs=4),
     bbox_head=dict(
         type='opera.PETRHead',
-        num_query=81,
+        num_query=100,
         num_classes=1,
         in_channels=2048,
         sync_cls_avg_factor=True,
@@ -169,7 +173,7 @@ model = dict(
         transformer=dict(
             type='opera.PETRTransformer',
             num_keypoints=14,
-            two_stage_num_proposals=81,
+            two_stage_num_proposals=100,
             encoder=dict(
                 type='mmcv.DetrTransformerEncoder',
                 num_layers=6,
@@ -262,7 +266,7 @@ model = dict(
             kpt_cost=dict(type='opera.KptMSECost', weight=10.0),
             #oks_cost=dict(type='opera.OksCost', weight=7.0))),
             oks_cost=dict(type='opera.OksCost', weight=0.0))),
-    test_cfg=dict(max_per_img=81))
+    test_cfg=dict(max_per_img=100))
 optimizer = dict(
     type='AdamW',
     lr=2e-05, # 2e-05 3e
@@ -276,7 +280,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2)) # max_norm=0.
 lr_config = dict(policy='step', step=[400]) #400
 runner = dict(type='EpochBasedRunner', max_epochs=450) #450
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/42_wifipose_2d_baseline_SDP_offline_power_xfall'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/43_wifipose_2d_baseline_SDP300_imagelike_lagwindow_centerctx'
 auto_resume = False
 #gpu_ids = range(0, 3)
 gpu_ids = range(0, 1)
