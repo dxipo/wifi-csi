@@ -14,6 +14,7 @@ from mmdet.models.detectors.detr import DETR
 
 from mmcv.cnn import Linear
 
+from dataset_model import SDPToImageLikeTranslator
 from opera.core.keypoint import bbox_kpt2result, kpt_mapping_back
 from ..builder import DETECTORS
 
@@ -31,18 +32,42 @@ class PETR(DETR):
                  patch_stride=None,
                  patch_padding=0,
                  patch_out_dim=256,
+                 image_translator_cfg=None,
+                 translator_detach=False,
                  **kwargs):
         self.input_dim = input_dim
         self.input_adapter = input_adapter
+        self.translator_detach = translator_detach
         super(DETR, self).__init__(*args, **kwargs)
         if self.input_adapter == 'linear':
             self.head = Linear(self.input_dim, 256)
         elif self.input_adapter == 'conv_patch':
             if patch_stride is None:
                 patch_stride = patch_kernel_size
+            self.patch_input_dim = self.input_dim
             self.patch_embed = nn.Sequential(
                 nn.Conv2d(
-                    self.input_dim,
+                    self.patch_input_dim,
+                    patch_out_dim,
+                    kernel_size=tuple(patch_kernel_size),
+                    stride=tuple(patch_stride),
+                    padding=patch_padding),
+                nn.BatchNorm2d(patch_out_dim),
+                nn.ReLU(inplace=True))
+            self.head = nn.Identity()
+        elif self.input_adapter in ('sdp_image_translator', 'sdp_to_image'):
+            image_translator_cfg = dict(image_translator_cfg or {})
+            image_translator_cfg.setdefault('in_channels', self.input_dim)
+            image_translator_cfg.setdefault('target_size', (360, 640))
+            image_translator_cfg.setdefault('input_layout', 'auto')
+            image_translator_cfg.setdefault('output_layout', 'bchw')
+            self.image_translator = SDPToImageLikeTranslator(**image_translator_cfg)
+            self.patch_input_dim = image_translator_cfg.get('output_channels', 3)
+            if patch_stride is None:
+                patch_stride = patch_kernel_size
+            self.patch_embed = nn.Sequential(
+                nn.Conv2d(
+                    self.patch_input_dim,
                     patch_out_dim,
                     kernel_size=tuple(patch_kernel_size),
                     stride=tuple(patch_stride),
@@ -56,6 +81,20 @@ class PETR(DETR):
         #--------only amp
         #self.head = Linear(30, 256)
 
+    def _patch_embed_tokens(self, img):
+        assert img.ndim == 4, \
+            f"conv_patch expects 4D image-like input, got shape {tuple(img.shape)}"
+        if img.shape[-1] == self.patch_input_dim:
+            img = img.permute(0, 3, 1, 2).contiguous()
+        elif img.shape[1] == self.patch_input_dim:
+            img = img.contiguous()
+        else:
+            raise AssertionError(
+                f"conv_patch channel mismatch: got shape {tuple(img.shape)}, "
+                f"expect last or second dim to be {self.patch_input_dim}")
+        feat = self.patch_embed(img)
+        return feat.flatten(2).transpose(1, 2).contiguous()
+
     def _extract_token_features(self, img):
         if self.input_adapter == 'linear':
             bs = img.shape[0]
@@ -66,18 +105,13 @@ class PETR(DETR):
             return self.head(x)
 
         if self.input_adapter == 'conv_patch':
-            assert img.ndim == 4, \
-                f"conv_patch expects 4D image-like input, got shape {tuple(img.shape)}"
-            if img.shape[-1] == self.input_dim:
-                img = img.permute(0, 3, 1, 2).contiguous()
-            elif img.shape[1] == self.input_dim:
-                img = img.contiguous()
-            else:
-                raise AssertionError(
-                    f"conv_patch channel mismatch: got shape {tuple(img.shape)}, "
-                    f"expect last or second dim to be {self.input_dim}")
-            feat = self.patch_embed(img)
-            return feat.flatten(2).transpose(1, 2).contiguous()
+            return self._patch_embed_tokens(img)
+
+        if self.input_adapter in ('sdp_image_translator', 'sdp_to_image'):
+            img = self.image_translator(img)
+            if self.translator_detach:
+                img = img.detach()
+            return self._patch_embed_tokens(img)
 
         raise ValueError(f'Unsupported input_adapter={self.input_adapter}')
         
