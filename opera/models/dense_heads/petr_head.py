@@ -75,6 +75,9 @@ class PETRHead(AnchorFreeHead):
                  loss_kpt=dict(type='L2Loss', loss_weight=70.0),
                  loss_oks=dict(type='OKSLoss', loss_weight=2.0),
                  loss_hm=dict(type='CenterFocalLoss', loss_weight=4.0),
+                 distill_stage=0,
+                 token_dim=768,
+                 loss_token=None,
                  as_two_stage=True,
                  with_kpt_refine=True,
                  train_cfg=dict(
@@ -93,6 +96,10 @@ class PETRHead(AnchorFreeHead):
         # since it brings inconvenience when the initialization of
         # `AnchorFreeHead` is called.
         super(AnchorFreeHead, self).__init__(init_cfg)
+        self.distill_stage = distill_stage
+        self.token_dim = token_dim
+        self.loss_token = build_loss(loss_token) if loss_token is not None else None
+        self.with_token_distill = self.loss_token is not None
         self.bg_cls_weight = 0
         self.sync_cls_avg_factor = sync_cls_avg_factor
         if train_cfg:
@@ -195,6 +202,12 @@ class PETRHead(AnchorFreeHead):
             num_pred = self.transformer.refine_decoder.num_layers
             self.refine_kpt_branches = _get_clones(refine_kpt_branch, num_pred)
         self.fc_hm = Linear(self.embed_dims, self.num_keypoints)
+        if self.with_token_distill:
+            self.token_head = nn.Sequential(
+                Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(inplace=True),
+                Linear(self.embed_dims, self.token_dim),
+            )
 
     def init_weights(self):
         """Initialize weights of the PETR head."""
@@ -212,6 +225,10 @@ class PETRHead(AnchorFreeHead):
         # initialize bias for heatmap prediction
         bias_init = bias_init_with_prob(0.1)
         normal_init(self.fc_hm, std=0.01, bias=bias_init)
+        if getattr(self, 'with_token_distill', False):
+            for m in self.token_head.modules():
+                if isinstance(m, nn.Linear):
+                    normal_init(m, std=0.01)
 
     def forward(self, mlvl_feats, img_metas):
         """Forward function.
@@ -385,6 +402,26 @@ class PETRHead(AnchorFreeHead):
             losses[f'd{i}.loss_kpt_refine'] = loss_kpt
         return losses
 
+    def _pool_memory(self, memory, bs):
+        """Pool transformer memory into one token vector per sample."""
+        if memory is None:
+            raise ValueError('memory is None, cannot pool token')
+
+        if memory.dim() == 4:
+            return memory.mean(dim=(2, 3))
+
+        if memory.dim() == 3:
+            if memory.size(0) == bs:
+                mem = memory
+            elif memory.size(1) == bs:
+                mem = memory.permute(1, 0, 2)
+            else:
+                raise RuntimeError(
+                    f'Unexpected memory batch dimension: {tuple(memory.shape)}')
+            return mem.mean(dim=1)
+
+        raise RuntimeError(f'Unexpected memory shape: {tuple(memory.shape)}')
+
     # over-write because img_metas are needed as inputs for bbox_head.
     def forward_train(self,
                       x,
@@ -395,6 +432,7 @@ class PETRHead(AnchorFreeHead):
                       gt_areas=None,
                       gt_bboxes_ignore=None,
                       proposal_cfg=None,
+                      gt_token=None,
                       **kwargs):
         """Forward function for training mode.
 
@@ -419,8 +457,39 @@ class PETRHead(AnchorFreeHead):
             dict[str, Tensor]: A dictionary of loss components.
         """
         assert proposal_cfg is None, '"proposal_cfg" must be None'
+        if gt_token is None:
+            gt_token = kwargs.get('gt_token', None)
+
         outs = self(x, img_metas)
         memory = outs[-1]
+        loss_token = None
+
+        if self.with_token_distill and self.distill_stage in (1, 2):
+            bs = len(img_metas)
+            if gt_token is None:
+                raise ValueError(
+                    'gt_token is required for distill_stage=1/2, but got None')
+
+            if isinstance(gt_token, (list, tuple)):
+                gt_token = torch.stack(
+                    [t.to(memory.device).float() for t in gt_token], dim=0)
+            else:
+                gt_token = gt_token.to(memory.device).float()
+                if gt_token.dim() == 1:
+                    gt_token = gt_token.unsqueeze(0)
+
+            if gt_token.dim() != 2 or gt_token.size(1) != self.token_dim:
+                raise ValueError(
+                    f'gt_token shape should be (B,{self.token_dim}), '
+                    f'but got {tuple(gt_token.shape)}')
+
+            pooled = self._pool_memory(memory, bs)
+            pred_token = self.token_head(pooled)
+            loss_token = self.loss_token(pred_token, gt_token)
+
+            if self.distill_stage == 1:
+                return dict(loss_token=loss_token)
+
         outs = outs[:-1]
         if gt_labels is None:
             loss_inputs = outs + (gt_bboxes, gt_keypoints, gt_areas, img_metas)
@@ -434,6 +503,8 @@ class PETRHead(AnchorFreeHead):
         if self.with_kpt_refine:
             losses = self.forward_refine(memory, refine_targets,
                                         losses, img_metas)
+        if self.with_token_distill and self.distill_stage == 2:
+            losses['loss_token'] = loss_token
         return losses
 
     @force_fp32(apply_to=('all_cls_scores', 'all_kpt_preds'))
@@ -884,12 +955,6 @@ class PETRHead(AnchorFreeHead):
         num_valid_kpt = torch.clamp(
             reduce_mean(kpt_weights.sum()), min=1).item()
         # assert num_valid_kpt == (kpt_targets>0).sum().item()
-        enp = [2,3,4,6,8,10]
-        weight_enhance = torch.ones_like(kpt_preds).reshape(-1,14,3)
-        weight_enhance[:,enp,:] = weight_enhance[:,enp,:]*3
-        weight_enhance = weight_enhance.reshape(-1,42)
-        '''loss_kpt = self.loss_kpt_rpn(
-            kpt_preds*weight_enhance, kpt_targets*weight_enhance, kpt_weights, avg_factor=num_valid_kpt)'''
         loss_kpt = self.loss_kpt_rpn(
             kpt_preds, kpt_targets, kpt_weights, avg_factor=num_valid_kpt)
 

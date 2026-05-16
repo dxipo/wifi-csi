@@ -3,10 +3,13 @@ data_root = '../data/wifipose'
 train_pipeline = [
     dict(
         type='opera.DefaultFormatBundle',
-        extra_keys=['gt_keypoints', 'gt_labels']),
+        extra_keys=['gt_keypoints', 'gt_labels', 'gt_token']),
     dict(
         type='mmdet.Collect',
-        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas'],
+        keys=[
+            'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas',
+            'gt_token'
+        ],
         meta_keys=[])
 ]
 test_pipeline = [
@@ -35,11 +38,12 @@ data = dict(
         pipeline=[
             dict(
                 type='opera.DefaultFormatBundle',
-                extra_keys=['gt_keypoints', 'gt_labels']),
+                extra_keys=['gt_keypoints', 'gt_labels', 'gt_token']),
             dict(
                 type='mmdet.Collect',
                 keys=[
-                    'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints', 'gt_areas'
+                    'img', 'gt_bboxes', 'gt_labels', 'gt_keypoints',
+                    'gt_areas', 'gt_token'
                 ],
                 meta_keys=[])
         ],
@@ -95,7 +99,7 @@ log_config = dict(
 custom_hooks = [dict(type='NumClassCheckHook')]
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = None
+load_from = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/42_wifipose_2d_baseline_SDP_offline_power_xfall/latest.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -131,6 +135,9 @@ model = dict(
         with_kpt_refine=True,
         as_two_stage=True,
         num_keypoints=14,
+        distill_stage=2,
+        token_dim=768,
+        loss_token=dict(type='mmdet.MSELoss', loss_weight=0.1),
         transformer=dict(
             type='opera.PETRTransformer',
             num_keypoints=14,
@@ -230,6 +237,6 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 lr_config = dict(policy='step', step=[400])
 runner = dict(type='EpochBasedRunner', max_epochs=450)
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/42_wifipose_2d_baseline_SDP_offline_power_xfall'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/46_wifipose_2d_baseline_SDP_offline_power_xfall_stage2_distill'
 auto_resume = False
 gpu_ids = [0]

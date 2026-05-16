@@ -38,6 +38,7 @@ class PETR(DETR):
                       gt_labels,
                       gt_keypoints,
                       gt_areas,
+                      gt_token=None,
                       gt_bboxes_ignore=None):
         """
         Args:
@@ -76,7 +77,8 @@ class PETR(DETR):
         losses = self.bbox_head.forward_train(
             x, img_metas, gt_bboxes,
             gt_labels, gt_keypoints,
-            gt_areas, gt_bboxes_ignore
+            gt_areas, gt_bboxes_ignore,
+            gt_token=gt_token
         )
         return losses
 
