@@ -90,8 +90,8 @@ data = dict(
                 ])
         ],
         mode='test'))
-evaluation = dict(interval=1, metric='mpjpe')
-checkpoint_config = dict(interval=5, max_keep_ckpts=100)
+evaluation = dict(interval=1, metric='mpjpe', save_best='mpjpe', rule='less')
+checkpoint_config = dict(interval=5, max_keep_ckpts=30)
 log_config = dict(
     interval=10,
     hooks=[dict(type='TextLoggerHook'),
@@ -137,7 +137,7 @@ model = dict(
         num_keypoints=14,
         distill_stage=2,
         token_dim=768,
-        loss_token=dict(type='mmdet.MSELoss', loss_weight=0.1),
+        loss_token=dict(type='mmdet.MSELoss', loss_weight=0.03),
         transformer=dict(
             type='opera.PETRTransformer',
             num_keypoints=14,
@@ -226,7 +226,7 @@ model = dict(
     test_cfg=dict(max_per_img=81))
 optimizer = dict(
     type='AdamW',
-    lr=2e-05,
+    lr=2e-06,
     weight_decay=0.0001,
     paramwise_cfg=dict(
         custom_keys=dict(
@@ -234,9 +234,9 @@ optimizer = dict(
             sampling_offsets=dict(lr_mult=0.1),
             reference_points=dict(lr_mult=0.1))))
 optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
-lr_config = dict(policy='step', step=[400])
-runner = dict(type='EpochBasedRunner', max_epochs=450)
+lr_config = dict(policy='step', step=[60, 85])
+runner = dict(type='EpochBasedRunner', max_epochs=100)
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/46_wifipose_2d_baseline_SDP_offline_power_xfall_stage2_distill'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/47_wifipose_2d_baseline_SDP_offline_power_xfall_stage2_distill_finetune_v2'
 auto_resume = False
 gpu_ids = [0]
