@@ -327,6 +327,211 @@ class WifiPoseDataset(dataset):
         
         return np.array(keypoints_list)
 
+    @staticmethod
+    def _to_float(value):
+        if torch.is_tensor(value):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    @staticmethod
+    def _mean_or_zero(values):
+        return float(np.mean(values)) if len(values) > 0 else 0.0
+
+    @staticmethod
+    def _img_wh(info):
+        img_shape = info.get('img_shape', (360, 640, 3))
+        return float(img_shape[1]), float(img_shape[0])
+
+    def _extract_person_predictions(self, det_bboxes, det_keypoints,
+                                    gt_keypoints):
+        if isinstance(det_keypoints, (list, tuple)):
+            if len(det_keypoints) == 0:
+                kpt_pred = np.zeros((0, 14, 2), dtype=np.float32)
+            else:
+                kpt_pred = det_keypoints[0]
+        else:
+            kpt_pred = det_keypoints
+
+        if isinstance(det_bboxes, (list, tuple)):
+            if len(det_bboxes) == 0:
+                bbox_pred = np.zeros((0, 5), dtype=np.float32)
+            else:
+                bbox_pred = det_bboxes[0]
+        else:
+            bbox_pred = det_bboxes
+
+        kpt_pred = torch.as_tensor(
+            kpt_pred, dtype=gt_keypoints.dtype, device=gt_keypoints.device)
+        bbox_pred = torch.as_tensor(
+            bbox_pred, dtype=gt_keypoints.dtype, device=gt_keypoints.device)
+
+        if kpt_pred.numel() == 0:
+            kpt_pred = gt_keypoints.new_zeros((0, gt_keypoints.shape[1], 2))
+        elif kpt_pred.dim() == 2:
+            kpt_pred = kpt_pred.unsqueeze(0)
+
+        if bbox_pred.numel() == 0:
+            bbox_pred = gt_keypoints.new_zeros((0, 5))
+        elif bbox_pred.dim() == 1:
+            bbox_pred = bbox_pred.unsqueeze(0)
+
+        num_pred = min(kpt_pred.shape[0], bbox_pred.shape[0])
+        kpt_pred = kpt_pred[:num_pred]
+        bbox_pred = bbox_pred[:num_pred]
+        if bbox_pred.shape[1] >= 5:
+            scores = bbox_pred[:, 4]
+        else:
+            scores = gt_keypoints.new_ones((num_pred,))
+
+        return bbox_pred, kpt_pred, scores
+
+    @staticmethod
+    def _sort_indices_by_score(scores):
+        if scores.numel() == 0:
+            return scores.new_zeros((0,), dtype=torch.long)
+        return torch.argsort(scores, descending=True)
+
+    def _select_keypoints_by_score(self, kpt_pred, scores, topk=None):
+        order = self._sort_indices_by_score(scores)
+        if topk is not None:
+            order = order[:min(int(topk), int(order.numel()))]
+        return kpt_pred[order]
+
+    def _bboxes_to_pixel(self, bboxes, img_wh):
+        if torch.is_tensor(bboxes):
+            boxes = bboxes.detach().cpu().float().numpy()
+        else:
+            boxes = np.asarray(bboxes, dtype=np.float32)
+
+        if boxes.size == 0:
+            return boxes.reshape(0, 4).astype(np.float32)
+
+        boxes = boxes[:, :4].astype(np.float32, copy=True)
+        W, H = img_wh
+        coord_max = np.nanmax(boxes) if boxes.size else 0.0
+        coord_min = np.nanmin(boxes) if boxes.size else 0.0
+        if coord_max <= 2.0 and coord_min >= -0.5:
+            boxes[:, [0, 2]] *= W
+            boxes[:, [1, 3]] *= H
+
+        x1 = np.minimum(boxes[:, 0], boxes[:, 2])
+        y1 = np.minimum(boxes[:, 1], boxes[:, 3])
+        x2 = np.maximum(boxes[:, 0], boxes[:, 2])
+        y2 = np.maximum(boxes[:, 1], boxes[:, 3])
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, W)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, H)
+        return boxes.astype(np.float32)
+
+    @staticmethod
+    def _bbox_iou_matrix(pred_boxes, gt_boxes):
+        if pred_boxes.size == 0 or gt_boxes.size == 0:
+            return np.zeros((pred_boxes.shape[0], gt_boxes.shape[0]),
+                            dtype=np.float32)
+
+        px1, py1, px2, py2 = [pred_boxes[:, i:i + 1] for i in range(4)]
+        gx1, gy1, gx2, gy2 = [gt_boxes[:, i][None, :] for i in range(4)]
+
+        inter_x1 = np.maximum(px1, gx1)
+        inter_y1 = np.maximum(py1, gy1)
+        inter_x2 = np.minimum(px2, gx2)
+        inter_y2 = np.minimum(py2, gy2)
+        inter_w = np.maximum(inter_x2 - inter_x1, 0.0)
+        inter_h = np.maximum(inter_y2 - inter_y1, 0.0)
+        inter = inter_w * inter_h
+
+        pred_area = np.maximum(px2 - px1, 0.0) * np.maximum(py2 - py1, 0.0)
+        gt_area = np.maximum(gx2 - gx1, 0.0) * np.maximum(gy2 - gy1, 0.0)
+        union = pred_area + gt_area - inter
+        return inter / np.maximum(union, 1e-6)
+
+    def _compute_bbox_ap_for_thr(self, ap_items, iou_thr, area_range=None):
+        detections = []
+        gt_by_img = {}
+        total_gt = 0
+
+        for item in ap_items:
+            gt_boxes = item['gt_boxes']
+            gt_areas = item['gt_areas']
+            if area_range is not None:
+                low, high = area_range
+                area_mask = (gt_areas >= low) & (gt_areas < high)
+                gt_boxes = gt_boxes[area_mask]
+
+            if gt_boxes.shape[0] == 0:
+                continue
+
+            image_id = item['image_id']
+            gt_by_img[image_id] = {
+                'boxes': gt_boxes,
+                'matched': np.zeros((gt_boxes.shape[0],), dtype=bool)
+            }
+            total_gt += gt_boxes.shape[0]
+
+            for box, score in zip(item['pred_boxes'], item['scores']):
+                detections.append((float(score), image_id, box))
+
+        if total_gt == 0:
+            return np.nan
+
+        detections.sort(key=lambda x: x[0], reverse=True)
+        tp = np.zeros((len(detections),), dtype=np.float32)
+        fp = np.zeros((len(detections),), dtype=np.float32)
+
+        for det_idx, (_, image_id, pred_box) in enumerate(detections):
+            gt_info = gt_by_img.get(image_id)
+            if gt_info is None:
+                fp[det_idx] = 1.0
+                continue
+
+            gt_boxes = gt_info['boxes']
+            ious = self._bbox_iou_matrix(pred_box[None, :], gt_boxes)[0]
+            best_gt = int(np.argmax(ious)) if ious.size else -1
+            best_iou = float(ious[best_gt]) if best_gt >= 0 else 0.0
+            if (best_iou >= iou_thr and best_gt >= 0
+                    and not gt_info['matched'][best_gt]):
+                tp[det_idx] = 1.0
+                gt_info['matched'][best_gt] = True
+            else:
+                fp[det_idx] = 1.0
+
+        tp_cum = np.cumsum(tp)
+        fp_cum = np.cumsum(fp)
+        recalls = tp_cum / max(float(total_gt), 1e-6)
+        precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1e-6)
+
+        recall_grid = np.linspace(0.0, 1.0, 101)
+        ap = 0.0
+        for recall_thr in recall_grid:
+            valid = precisions[recalls >= recall_thr]
+            ap += float(valid.max()) if valid.size else 0.0
+        return ap / len(recall_grid)
+
+    def _compute_bbox_ap_metrics(self, ap_items):
+        iou_thrs = np.arange(0.5, 0.96, 0.05)
+        area_all = (0.0, 1e10)
+        area_m = (32.0 * 32.0, 96.0 * 96.0)
+        area_l = (96.0 * 96.0, 1e10)
+
+        def mean_ap(area_range):
+            vals = [
+                self._compute_bbox_ap_for_thr(ap_items, float(thr), area_range)
+                for thr in iou_thrs
+            ]
+            vals = [v for v in vals if not np.isnan(v)]
+            return float(np.mean(vals) * 100.0) if vals else 0.0
+
+        ap50 = self._compute_bbox_ap_for_thr(ap_items, 0.50, area_all)
+        ap75 = self._compute_bbox_ap_for_thr(ap_items, 0.75, area_all)
+
+        return OrderedDict([
+            ('AP', mean_ap(area_all)),
+            ('AP50', 0.0 if np.isnan(ap50) else float(ap50 * 100.0)),
+            ('AP75', 0.0 if np.isnan(ap75) else float(ap75 * 100.0)),
+            ('APm', mean_ap(area_m)),
+            ('APl', mean_ap(area_l)),
+        ])
+
     def evaluate(self,
                  results,
                  metric='keypoints',
@@ -337,38 +542,44 @@ class WifiPoseDataset(dataset):
                  iou_thrs=None,
                  metric_items=None):
 
-        mpjpe_2d_list = []
-        mpjpe_x_list = []
-        mpjpe_y_list = []
+        metric_lists = OrderedDict([
+            ('mpjpe', []),
+            ('mpjpe_x', []),
+            ('mpjpe_y', []),
+            ('mpjpe_top1', []),
+            ('mpjpe_top1_x', []),
+            ('mpjpe_top1_y', []),
+            ('mpjpe_top5_oracle', []),
+            ('mpjpe_top5_oracle_x', []),
+            ('mpjpe_top5_oracle_y', []),
+            ('mpjpe_top20_oracle', []),
+            ('mpjpe_top20_oracle_x', []),
+            ('mpjpe_top20_oracle_y', []),
+            ('mpjpe_oracle_all', []),
+            ('mpjpe_oracle_all_x', []),
+            ('mpjpe_oracle_all_y', []),
+        ])
+        ap_items = []
 
         for i in range(len(results)):
             info = self.get_item_single_frame(i)
             gt_keypoints = info['gt_keypoints']  # Tensor (N,14,3) or (N,14,2), normalized
             data_name = info.get('img_name', str(i))
+            img_wh = self._img_wh(info)
 
             det_bboxes, det_keypoints = results[i]
 
-            # 你的模型通常返回 det_keypoints 为 list（按 class），只有 1 类 person
-            # 我们把它统一成 Tensor: (M,14,2/3)
-            if isinstance(det_keypoints, (list, tuple)):
-                # person 类一般在 index 0
-                if len(det_keypoints) == 0:
-                    continue
-                kpt_pred = det_keypoints[0]
-            else:
-                kpt_pred = det_keypoints
-
-            kpt_pred = torch.as_tensor(
-                kpt_pred,
-                dtype=gt_keypoints.dtype,
-                device=gt_keypoints.device
-            )
+            bbox_pred, kpt_pred, scores = self._extract_person_predictions(
+                det_bboxes, det_keypoints, gt_keypoints)
+            if kpt_pred.shape[0] == 0:
+                continue
 
             # ================= DEBUG START =================
             if i == 0:
                 print("\n========== DEBUG EVALUATE ==========")
                 print("[DBG] GT shape:", gt_keypoints.shape)
                 print("[DBG] Pred shape:", kpt_pred.shape)
+                print("[DBG] Score shape:", scores.shape)
 
                 print("[DBG] GT min/max:",
                       gt_keypoints[..., :2].min().item(),
@@ -390,26 +601,46 @@ class WifiPoseDataset(dataset):
                 print("====================================\n")
             # ================= DEBUG END =================
 
-            # 关键：让 calc_mpjpe 去做匹配（GT N=1 vs Pred M=100）
+            # Backward-compatible metric: keep the original all-query oracle
+            # MPJPE as `mpjpe`, because previous experiments used this number.
             mpjpe_2d, mpjpex, mpjpey, _ = self.calc_mpjpe(
-                gt_keypoints, kpt_pred, data_name, root=[5, 7]
+                gt_keypoints, kpt_pred, data_name, root=[5, 7],
+                img_shape=info.get('img_shape', None)
             )
+            metric_lists['mpjpe'].append(self._to_float(mpjpe_2d))
+            metric_lists['mpjpe_x'].append(self._to_float(mpjpex))
+            metric_lists['mpjpe_y'].append(self._to_float(mpjpey))
+            metric_lists['mpjpe_oracle_all'].append(self._to_float(mpjpe_2d))
+            metric_lists['mpjpe_oracle_all_x'].append(self._to_float(mpjpex))
+            metric_lists['mpjpe_oracle_all_y'].append(self._to_float(mpjpey))
 
-            # 统一转 float
-            mpjpe_2d_list.append(
-                float(mpjpe_2d.detach().cpu().item()) if torch.is_tensor(mpjpe_2d) else float(mpjpe_2d))
-            mpjpe_x_list.append(float(mpjpex.detach().cpu().item()) if torch.is_tensor(mpjpex) else float(mpjpex))
-            mpjpe_y_list.append(float(mpjpey.detach().cpu().item()) if torch.is_tensor(mpjpey) else float(mpjpey))
+            for topk, prefix in [(1, 'mpjpe_top1'),
+                                 (5, 'mpjpe_top5_oracle'),
+                                 (20, 'mpjpe_top20_oracle')]:
+                selected_kpts = self._select_keypoints_by_score(
+                    kpt_pred, scores, topk=topk)
+                top_mpjpe, top_x, top_y, _ = self.calc_mpjpe(
+                    gt_keypoints, selected_kpts, data_name=None, root=[5, 7],
+                    img_shape=info.get('img_shape', None)
+                )
+                metric_lists[prefix].append(self._to_float(top_mpjpe))
+                metric_lists[f'{prefix}_x'].append(self._to_float(top_x))
+                metric_lists[f'{prefix}_y'].append(self._to_float(top_y))
 
-        mpjpe = float(np.mean(mpjpe_2d_list)) if len(mpjpe_2d_list) > 0 else 0.0
-        mpjpe_x = float(np.mean(mpjpe_x_list)) if len(mpjpe_x_list) > 0 else 0.0
-        mpjpe_y = float(np.mean(mpjpe_y_list)) if len(mpjpe_y_list) > 0 else 0.0
+            gt_bboxes = info['gt_bboxes'].detach().cpu().float().numpy()
+            gt_areas = info['gt_areas'].detach().cpu().float().numpy()
+            ap_items.append(dict(
+                image_id=i,
+                gt_boxes=self._bboxes_to_pixel(gt_bboxes, img_wh),
+                gt_areas=gt_areas,
+                pred_boxes=self._bboxes_to_pixel(bbox_pred, img_wh),
+                scores=scores.detach().cpu().float().numpy()
+            ))
 
-        result = {
-            'mpjpe': mpjpe,  # 像素版 or normalized 取决于你 calc_mpjpe
-            'mpjpe_x': mpjpe_x,  # |dx| mean
-            'mpjpe_y': mpjpe_y  # |dy| mean
-        }
+        result = OrderedDict()
+        for key, values in metric_lists.items():
+            result[key] = self._mean_or_zero(values)
+        result.update(self._compute_bbox_ap_metrics(ap_items))
         return OrderedDict(result)
 
     # def evaluate(self,
@@ -749,7 +980,8 @@ class WifiPoseDataset(dataset):
     #     dummy = torch.tensor(0.0, device=device)
     #     return mpjpe_pix, mpjpe_x_pix, mpjpe_y_pix, dummy
 
-    def calc_mpjpe(self, real, pred, data_name=None, root=None):
+    def calc_mpjpe(self, real, pred, data_name=None, root=None,
+                   img_shape=None, use_visible=False):
         """
         Pixel-space 2D MPJPE with matching (GT persons vs predicted queries).
 
@@ -775,15 +1007,29 @@ class WifiPoseDataset(dataset):
         m = pred_xy.shape[0]  # M queries  (often 100)
         j = real_xy.shape[1]  # 14
 
+        if m == 0:
+            W, H = self._img_wh({'img_shape': img_shape or (360, 640, 3)})
+            miss = torch.tensor((W * W + H * H) ** 0.5, device=device,
+                                dtype=real_xy.dtype)
+            return miss, miss, miss, torch.tensor(0.0, device=device)
+
         assert real_xy.shape[1] == pred_xy.shape[1], f"J mismatch: {real_xy.shape} vs {pred_xy.shape}"
         assert real_xy.shape[2] == 2 and pred_xy.shape[2] == 2, f"need xy only"
+
+        if use_visible and real.shape[-1] >= 3:
+            valid_mask = (real[..., 2] > 0).float()
+        else:
+            valid_mask = torch.ones(real_xy.shape[:2], device=device,
+                                    dtype=real_xy.dtype)
+        valid_denom = valid_mask.sum(dim=-1).clamp(min=1.0)
 
         # ---- compute cost matrix: (N,M) ----
         # cost[i,k] = mean L2 distance over joints (normalized space)
         # (N,1,14,2) - (1,M,14,2) -> (N,M,14,2)
         diff_nm = real_xy.unsqueeze(1) - pred_xy.unsqueeze(0)
         dist_nm = torch.norm(diff_nm, dim=-1)  # (N,M,14)
-        cost = dist_nm.mean(dim=-1)  # (N,M)
+        cost = (dist_nm * valid_mask.unsqueeze(1)).sum(dim=-1) / \
+            valid_denom.unsqueeze(1)  # (N,M)
 
         # ---- greedy matching like original code ----
         # original used while min(distance_array) < threshold and marks occupied
@@ -854,17 +1100,17 @@ class WifiPoseDataset(dataset):
             print("[DBG] chosen query min/max:", pred_xy[chosen].min().item(), pred_xy[chosen].max().item())
 
         # ---- convert normalized diff -> pixel diff ----
-        # NOTE: You hardcoded img_shape=(360,640,3) in dataset, so use that.
-        W, H = 640.0, 360.0
+        W, H = self._img_wh({'img_shape': img_shape or (360, 640, 3)})
         diff = real_xy - new_pred_xy  # (N,14,2)
         dx_pix = diff[..., 0] * W
         dy_pix = diff[..., 1] * H
 
         dist_pix = torch.sqrt(dx_pix * dx_pix + dy_pix * dy_pix)  # (N,14)
 
-        mpjpe_pix = dist_pix.mean()
-        mpjpe_x_pix = torch.abs(dx_pix).mean()
-        mpjpe_y_pix = torch.abs(dy_pix).mean()
+        valid_sum = valid_mask.sum().clamp(min=1.0)
+        mpjpe_pix = (dist_pix * valid_mask).sum() / valid_sum
+        mpjpe_x_pix = (torch.abs(dx_pix) * valid_mask).sum() / valid_sum
+        mpjpe_y_pix = (torch.abs(dy_pix) * valid_mask).sum() / valid_sum
 
         dummy = torch.tensor(0.0, device=device)
         return mpjpe_pix, mpjpe_x_pix, mpjpe_y_pix, dummy
