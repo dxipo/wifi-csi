@@ -99,7 +99,7 @@ log_config = dict(
 custom_hooks = [dict(type='NumClassCheckHook')]
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/42_wifipose_2d_baseline_SDP_offline_power_xfall/latest.pth'
+load_from = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/42_wifipose_2d_baseline_SDP_offline_power_xfall/epoch_165.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -237,6 +237,6 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 lr_config = dict(policy='step', step=[60, 85])
 runner = dict(type='EpochBasedRunner', max_epochs=100)
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/47_wifipose_2d_baseline_SDP_offline_power_xfall_stage2_distill_finetune_v2'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/48_wifipose_2d_baseline_SDP_offline_power_xfall_stage2_distill_best_saved_ckpt'
 auto_resume = False
 gpu_ids = [0]
