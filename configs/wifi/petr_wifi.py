@@ -138,13 +138,9 @@ auto_scale_lr = dict(enable=False, base_batch_size=16)
 model = dict(
     type='opera.PETR',
     input_dim=3,
-    input_adapter='sdp_image_translator',
-    image_translator_cfg=dict(
-        target_size=(360, 640),
-        output_activation='none',
-    ),
-    patch_kernel_size=(18, 32),
-    patch_stride=(18, 32),
+    input_adapter='conv_patch',
+    patch_kernel_size=(3, 25),
+    patch_stride=(3, 25),
     patch_out_dim=256,
     backbone=dict(
         type='mmdet.ResNet',
@@ -284,7 +280,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2)) # max_norm=0.
 lr_config = dict(policy='step', step=[400]) #400
 runner = dict(type='EpochBasedRunner', max_epochs=450) #450
 find_unused_parameters = True
-work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/44_wifipose_2d_baseline_SDP140_translator_image_lagwindow_centerctx'
+work_dir = '/home/xl/CSI/Person-in-WiFi-3D-repo/result/50_wifipose_2d_baseline_SDP140_conv_patch_lagwindow_centerctx'
 auto_resume = False
 #gpu_ids = range(0, 3)
 gpu_ids = range(0, 1)
