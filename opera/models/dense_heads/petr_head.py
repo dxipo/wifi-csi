@@ -605,10 +605,13 @@ class PETRHead(AnchorFreeHead):
         num_valid_kpt = torch.clamp(
             reduce_mean(kpt_weights.sum()), min=1).item()
         # assert num_valid_kpt == (kpt_targets>0).sum().item()
-        enp = [2,3,4,6,8,10]
-        weight_enhance = torch.ones_like(kpt_preds).reshape(-1,14,3)
+        enp = [2, 3, 4, 6, 8, 10]
+        enp = [idx for idx in enp if idx < self.num_keypoints]
+        weight_enhance = torch.ones_like(kpt_preds).reshape(
+            -1, self.num_keypoints, 3)
         weight_enhance[:,enp,:] = weight_enhance[:,enp,:]*3
-        weight_enhance = weight_enhance.reshape(-1,42)
+        weight_enhance = weight_enhance.reshape(
+            -1, self.num_keypoints * 3)
         '''loss_kpt = self.loss_kpt(
             kpt_preds*weight_enhance, kpt_targets*weight_enhance, kpt_weights, avg_factor=num_valid_kpt)'''
         loss_kpt = self.loss_kpt(
@@ -815,10 +818,13 @@ class PETRHead(AnchorFreeHead):
         num_valid_kpt = torch.clamp(
             reduce_mean(kpt_weights.sum()), min=1).item()
         # assert num_valid_kpt == (kpt_targets>0).sum().item()
-        enp = [2,3,4,6,8,10]
-        weight_enhance = torch.ones_like(kpt_preds).reshape(-1,14,3)
+        enp = [2, 3, 4, 6, 8, 10]
+        enp = [idx for idx in enp if idx < self.num_keypoints]
+        weight_enhance = torch.ones_like(kpt_preds).reshape(
+            -1, self.num_keypoints, 3)
         weight_enhance[:,enp,:] = weight_enhance[:,enp,:]*3
-        weight_enhance = weight_enhance.reshape(-1,42)
+        weight_enhance = weight_enhance.reshape(
+            -1, self.num_keypoints * 3)
         '''loss_kpt = self.loss_kpt_rpn(
             kpt_preds*weight_enhance, kpt_targets*weight_enhance, kpt_weights, avg_factor=num_valid_kpt)'''
         loss_kpt = self.loss_kpt_rpn(
