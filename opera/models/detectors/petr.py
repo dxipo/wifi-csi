@@ -3,6 +3,7 @@ import mmcv
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon, Circle
 from mmdet.core.visualization import color_val_matplotlib
@@ -21,13 +22,50 @@ class PETR(DETR):
     """Implementation of `End-to-End Multi-Person Pose Estimation with
     Transformers`"""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self,
+                 *args,
+                 input_dim=60,
+                 input_stem='linear',
+                 stem_in_channels=6,
+                 stem_hidden_channels=64,
+                 stem_out_channels=256,
+                 **kwargs):
         super(DETR, self).__init__(*args, **kwargs)
-        #---------------------
-        self.head = Linear(60, 256)
-        
-        #--------only amp
-        #self.head = Linear(30, 256)
+        self.input_stem = input_stem
+        if input_stem == 'linear':
+            self.head = Linear(input_dim, stem_out_channels)
+        elif input_stem == 'conv2d':
+            self.head = nn.Sequential(
+                nn.Conv2d(
+                    stem_in_channels,
+                    stem_hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(stem_hidden_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(
+                    stem_hidden_channels,
+                    stem_out_channels,
+                    kernel_size=1,
+                    bias=True),
+                nn.ReLU(inplace=True))
+        else:
+            raise ValueError(f'Unsupported PETR input_stem: {input_stem}')
+
+    def extract_csi_tokens(self, img):
+        if self.input_stem == 'linear':
+            bs = img.size(0)
+            channel = img.shape[-1]
+            x = img.reshape(bs, -1, channel)
+            return self.head(x)
+        if self.input_stem == 'conv2d':
+            if img.dim() != 4:
+                raise ValueError(
+                    f'conv2d input_stem expects 4D CSI tensor, got {img.shape}')
+            feat = self.head(img)
+            return feat.flatten(2).transpose(1, 2).contiguous()
+        raise RuntimeError(f'Unsupported PETR input_stem: {self.input_stem}')
         
     def forward_train(self,
                       img,
@@ -61,9 +99,7 @@ class PETR(DETR):
         """
         super(SingleStageDetector, self).forward_train(img, img_metas)
         # x = self.extract_feat(img)
-        bs, _, _, _, channel = img.shape
-        x = img.reshape(bs, -1, channel)
-        x = self.head(x)
+        x = self.extract_csi_tokens(img)
         losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
                                               gt_labels, gt_keypoints,
                                               gt_areas, gt_bboxes_ignore)
@@ -109,9 +145,7 @@ class PETR(DETR):
         assert batch_size == 1, 'Currently only batch_size 1 for inference ' \
             f'mode is supported. Found batch_size {batch_size}.'
         
-        bs, _, _, _, channel = img.shape
-        x = img.reshape(bs, -1, channel)
-        feat = self.head(x)
+        feat = self.extract_csi_tokens(img)
         results_list = self.bbox_head.simple_test(
             feat, img_metas, rescale=rescale)
 
