@@ -505,7 +505,10 @@ class Config:
             based_on_style='pep8',
             blank_line_before_nested_class_or_def=True,
             split_before_expression_after_opening_paren=True)
-        text, _ = FormatCode(text, style_config=yapf_style, verify=True)
+        try:
+            text, _ = FormatCode(text, style_config=yapf_style, verify=True)
+        except TypeError:
+            text, _ = FormatCode(text, style_config=yapf_style)
 
         return text
 
