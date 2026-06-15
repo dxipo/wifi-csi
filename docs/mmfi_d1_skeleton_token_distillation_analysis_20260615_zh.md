@@ -26,6 +26,13 @@
 
 截至本文档整理时，D1 Stage2 仍在运行，最新结构化日志已验证到 `epoch 74/80`。当前最佳结果出现在 `epoch 6`，后续训练没有继续改善。
 
+2026-06-15 追加修订：
+
+1. D1 当前不再视为“微小提升有待确认”，而应直接判定为当前设计失败。
+2. 后续不优先做 `D1-init-only`、`D3-shuffled-token` 这类围绕 D1 微小差异的对照。
+3. 下一步应直接转向主路径耦合蒸馏，即让 teacher 知识约束 PETR 主 decoder/query 或最终 skeleton relation。
+4. 当前文档中的 MMFi `mpjpe` 是本分支代码实现中的 absolute MPJPE；MMFi 论文定义的 MPJPE 是 pelvis-aligned MPJPE，更接近本文档表中的 `mpjpe_pelvis`。
+
 ## 2. 当前分支与主要文件
 
 当前分支：
@@ -75,7 +82,42 @@ MMFi 的 3D 主监督使用：
 
 这和 Person-in-WiFi 3D 原论文的 `14 x 3` 不同。因此 MMFi 的 MPJPE 只能和 MMFi 自身 baseline 比较，不能直接和 Person-in-WiFi 3D 的 MPJPE 数值横向比较。
 
-### 3.2 MMFi 2D skeleton 信息
+### 3.2 bbox 与标签字段核查
+
+核查当前代码和实际样本文件后，可以确认：
+
+| 数据集 | 3D 标签文件 | 实际 shape | 是否含 bbox 标注 | 当前 dataset 中 `gt_bboxes` |
+|---|---|---:|---|---|
+| Person-in-WiFi 3D | `keypoint/*.npy` | `N x 14 x 3` | 否 | 空 tensor |
+| MMFi | `ground_truth.npy` | `T x 17 x 3` | 否 | 空 tensor |
+
+Person-in-WiFi 3D 抽样：
+
+```text
+data/wifipose/train_data/keypoint/S11_01_10.npy -> (1, 14, 3)
+data/wifipose/test_data/keypoint/S52_14_338.npy -> (2, 14, 3)
+```
+
+MMFi 抽样：
+
+```text
+/home/xl/Downloads/MMFi_Dataset/MMFi_unzipped/E01/S01/A01/ground_truth.npy -> (297, 17, 3)
+/home/xl/Downloads/MMFi_Dataset/MMFi_unzipped/E01/S01/A01/rgb/frame001.npy -> (17, 2)
+```
+
+因此，MMFi 当前 absolute MPJPE 高、PA-MPJPE 低，并不是因为 MMFi 缺少 bbox 而 Person-in-WiFi 3D 有 bbox。两者在当前 3D 标签和训练代码中都没有使用人物框。
+
+需要区分的是：
+
+1. `bbox_head` 是 MMDetection/PETR 代码结构里的模块命名，不表示数据集中真实提供了 bbox。
+2. Person-in-WiFi 3D 的多人匹配在评价时使用 3D keypoint 平均距离做匹配，不使用 bbox。
+3. MMFi 当前是单人样本，评价时选择与 GT 平均距离最近的预测 skeleton，也不使用 bbox。
+
+MMFi 的 `pa_mpjpe` 明显低，主要来自 Procrustes 对齐会消除平移、旋转和尺度差异；这说明模型可能学到了一部分人体相对结构，但绝对空间位置，尤其全局平移，仍然误差较大。
+
+Person-in-WiFi 3D 论文和当前官方代码报告的是普通 MPJPE 以及三个维度误差，没有报告 PA-MPJPE。如果对 Person-in-WiFi 3D 也计算 PA-MPJPE，数值按定义一定会下降；但下降幅度需要保存预测结果后实际计算，不能直接从现有日志精确推断。直觉上，Person-in-WiFi 3D 的原始 MPJPE 已经约 `117mm`，且 `h/v/d` 三个方向误差相对均衡，PA 后会下降，但不应把它和 MMFi 当前 `pa_mpjpe` 直接横比。
+
+### 3.3 MMFi 2D skeleton 信息
 
 MMFi 中的视觉侧信息不是原始 RGB 图片，而是已经提取好的 2D skeleton：
 
@@ -89,7 +131,7 @@ rgb/frame*.npy -> 17 x 2
 2. 2D skeleton 只在训练期提供视觉模态的结构知识。
 3. 推理阶段 student 不读取 `rgb/frame*.npy`，仍然是 CSI-only。
 
-### 3.3 当前数据划分
+### 3.4 当前数据划分
 
 当前配置沿用 `MMFiPoseDataset` 中的 MMFi protocol 设置：
 
@@ -427,6 +469,21 @@ Stage1 token 拟合任务过于容易，已经完全饱和。
 
 这说明 student 的独立蒸馏分支可以拟合 teacher tokens，但不能直接证明这种拟合对 3D 主预测有帮助。
 
+更准确地说，Stage1 的问题不是普通意义上“训练集 loss 低所以一定过拟合”，而是目标设计本身和后续主任务错位：
+
+1. Stage1 没有 3D 主任务监督，只优化离线 teacher tokens。
+2. Teacher token 是固定目标，且经过 LayerNorm 后尺度稳定。
+3. Student 侧有额外的 `distill_queries`、cross-attention、FFN 和 projector，容量足以快速拟合 `18 x 256` 的 token。
+4. 这些 `distill_queries` 不等同于 PETR 主 decoder queries。
+5. Stage1 没有验证 MPJPE，因此 token loss 饱和不能说明 3D 能力提升。
+
+这会对 Stage2 造成两个风险：
+
+1. 共享 CSI 表征可能被预训练到“服务独立 token branch”的方向，而不是服务主 3D decoder。
+2. Stage2 一开始蒸馏 loss 已经接近 0，后续几乎没有来自 teacher 的有效梯度，训练实际退化为普通 3D fine-tuning。
+
+因此当前 Stage1 的失败点不是“拟合不够”，而是“拟合太容易且没有进入主预测路径”。
+
 ## 7. D1 Stage2: 3D 主任务 + Token Distillation
 
 ### 7.1 Stage2 目的
@@ -565,8 +622,8 @@ epoch 74 的详细指标：
 
 ```text
 D1-Stage2 的 best MPJPE 仅比 B0 best 低约 2.26。
-该幅度很小，且发生在 early epoch，后续训练没有保持。
-因此当前 D1 不能作为“蒸馏显著提升”的证据。
+该幅度太小，且发生在 early epoch，后续训练没有保持。
+因此当前 D1 应直接判定为无效，不再称为有效提升。
 ```
 
 ## 9. 为什么效果不好
@@ -636,7 +693,48 @@ best PA-MPJPE = 32.50
 
 而不是直接指望 2D skeleton teacher 解决 CSI 的绝对 x/y/z 估计。
 
-### 9.4 MMFi CSI-only 本身存在训练不稳定
+### 9.4 MMFi x 轴误差是共性，z 轴是主要不稳定来源
+
+对 MMFi B0、B1、D1 的完整验证日志做统计后，分轴误差有明显共性：
+
+| 实验 | x mean / min / max | y mean / min / max | z mean / min / max |
+|---|---|---|---|
+| B0 | `172.19 / 165.63 / 184.37` | `88.67 / 87.38 / 96.73` | `122.15 / 87.94 / 350.31` |
+| B1 | `171.72 / 165.36 / 187.08` | `93.74 / 87.41 / 108.91` | `200.23 / 51.59 / 474.23` |
+| D1 | `172.01 / 167.15 / 181.14` | `89.28 / 86.90 / 111.19` | `131.47 / 82.39 / 499.41` |
+
+D1 best epoch 6：
+
+```text
+mpjpe_x = 169.3197
+mpjpe_y = 88.4771
+mpjpe_z = 82.3911
+```
+
+B0 best epoch 10：
+
+```text
+mpjpe_x = 169.0166
+mpjpe_y = 87.7563
+mpjpe_z = 87.9405
+```
+
+这说明：
+
+1. `x` 轴误差高不是 D1 独有，而是当前 MMFi CSI 3D 实验的共性。
+2. D1 的 best 主要来自 `z` 轴略低于 B0，而不是解决了 `x` 轴问题。
+3. 训练不稳定时，最容易崩坏的是 `z` 轴，例如 D1 epoch 42 的 `mpjpe_z = 499.4103`。
+
+可能原因：
+
+1. MMFi 的 3D 标签以 RGB camera/world coordinate 为基准，而 WiFi CSI 的物理观测坐标和 camera 坐标并不是天然同一个坐标系。
+2. 当前 CSI 预处理做了 sample-level normalize，可能削弱了全局位置相关的幅度/相位尺度信息。
+3. 当前模型没有显式建模“人体整体 3D position”，而是直接回归所有 joint 的绝对坐标；如果整体平移错了，所有关节都会贡献 x 轴误差。
+4. PA-MPJPE 和 pelvis-aligned MPJPE 会弱化这类全局平移误差，因此看起来低很多。
+
+因此后续改进不能只优化相对骨架，还需要考虑全局位置分支或坐标系/预处理校准。
+
+### 9.5 MMFi CSI-only 本身存在训练不稳定
 
 B0 和 B1 已经显示 MMFi 3D 训练存在 early best 和后期退化的问题：
 
@@ -656,7 +754,7 @@ epoch 74 = 263.99
 
 尤其是 D1 中出现过 z 方向误差突然升高到 350、407、499 的情况，说明模型对深度或全局坐标的估计会发生阶段性崩坏。
 
-### 9.5 当前提升幅度可能只是随机波动
+### 9.6 当前 D1 不应称为提升
 
 B0 best：
 
@@ -682,11 +780,15 @@ D1 Stage2 best：
 0.9%
 ```
 
-在当前只跑一个 seed 的情况下，这个幅度不能排除随机波动、初始化差异、训练 schedule 差异或 checkpoint early selection 带来的影响。
+在当前结果下，没有必要继续围绕这个 `2.26mm` 差值判断来源。它既不稳定，也没有解决 x 轴系统误差和 z 轴崩坏问题。
 
-因此当前不能得出“D1 蒸馏有效”的结论。
+因此当前结论应改为：
 
-### 9.6 Loss 权重不是唯一问题
+```text
+D1 独立 token branch 蒸馏失败。
+```
+
+### 9.7 Loss 权重不是唯一问题
 
 直觉上可以想到调大 `distill_loss_weight`，但当前问题不是简单“蒸馏 loss 太小”。
 
@@ -713,23 +815,11 @@ distill_token_cos = 1.0000
 
 因此不建议马上把当前 D1 迁移到 PiW3D 全量数据。更合理的是先在 MMFi 上把蒸馏机制验证清楚。
 
-### 10.2 先做最小对照实验，判断当前 D1 的提升来源
+### 10.2 不再围绕 D1 微小差异做优先对照
 
-建议先补三个低成本对照：
+当前 D1 的结果距离目标相差很远，因此不建议优先继续做 `D1-init-only`、`D3-shuffled-token` 等围绕 D1 的小对照。
 
-| 编号 | 实验 | 目的 |
-|---|---|---|
-| C1 | D1-init-only | 加载 Stage1 checkpoint，但 Stage2 关闭 token/relation distill，判断 `240.30` 是否只是初始化带来的 |
-| C2 | D3-shuffled-token | 打乱 teacher tokens 后训练，判断是否只是正则化效果 |
-| C3 | B0-repeat-same-code | 用当前代码复跑 B0，固定 seed=42，排除代码变动和日志口径差异 |
-
-判断逻辑：
-
-```text
-如果 D1 ≈ C1：说明 Stage2 蒸馏项没有贡献，只是初始化作用。
-如果 D1 ≈ C2：说明 teacher token 的语义没有被有效利用。
-如果 D1 只比 B0 高 1% 以内：不能作为有效提升。
-```
+这些实验可以作为以后论文中的负实验补充，但当前阶段会浪费主要实验时间。下一步应直接针对核心问题改方法。
 
 ### 10.3 核心改法：把蒸馏耦合到主 decoder/query
 
@@ -780,7 +870,7 @@ L_bone: 骨向量方向或骨长比例约束
 
 这样 teacher 知识会直接进入主 3D 预测路径，而不是停留在独立辅助分支。
 
-### 10.4 蒸馏对象应偏向相对结构，而不是绝对坐标
+### 10.4 蒸馏对象应偏向相对结构，而不是 teacher 绝对 3D 坐标
 
 基于 T0 teacher 的结果，下一步更应该蒸馏：
 
@@ -792,7 +882,9 @@ pelvis-relative pose
 temporal consistency
 ```
 
-不建议把 teacher 的 `pred_3d` 直接当强监督。因为 teacher 的绝对 3D 仍有较大误差，直接监督可能把 2D skeleton 的深度歧义传给 student。
+不建议把 teacher 的 `pred_3d` 直接当强监督。因为真实 3D ground truth 已经存在，且 teacher 的绝对 3D 仍有较大误差，直接监督可能把 2D skeleton 的深度歧义传给 student。
+
+因此后续主路线可以直接去掉 `teacher_pred_3d`，只保留 teacher tokens 或 relation targets。若保留 `teacher_pred_3d`，也应作为对比实验或极小权重结构先验，而不是主监督。
 
 可以考虑：
 
@@ -819,7 +911,7 @@ L_rel_pose = SmoothL1(
 
 建议下一轮：
 
-1. 先跑 `20` epoch 快速验证。
+1. 先跑 `20` 或 `30` epoch 快速验证。
 2. 每 epoch 评估。
 3. 重点观察前 `10` epoch。
 4. 加 early stopping 或只比较 best within 20。
@@ -858,24 +950,7 @@ B0 baseline
 
 ### 11.1 立即执行的实验
 
-优先级最高的是验证当前 D1 的真实贡献：
-
-1. `D1-init-only`
-   - 复用 Stage1 checkpoint。
-   - Stage2 关闭 `distill_loss_weight` 和 `relation_loss_weight`。
-   - 如果结果接近 D1，说明 Stage2 蒸馏没有作用。
-
-2. `D3-shuffled-token`
-   - 使用 `shuffle_teacher_tokens=True`。
-   - 如果结果接近 D1，说明 token 语义没有被有效利用。
-
-3. `B0-repeat-same-code`
-   - 在当前分支和当前代码环境下复跑 B0。
-   - 避免把代码修正、随机性或环境差异误认为蒸馏提升。
-
-### 11.2 下一版方法实验
-
-如果上述对照证明当前 D1 确实不够，应进入 D4：
+当前应直接进入 D4：
 
 ```text
 D4 decoder-coupled skeleton relation distillation
@@ -888,15 +963,15 @@ D4 decoder-coupled skeleton relation distillation
 3. 删除或弱化独立 `distill_queries` 分支。
 4. 新增 joint relation 和 bone-level loss。
 5. 先跑 20 epoch 小实验。
-6. 与 B0-repeat、D1、D1-init-only、D3-shuffled 做对照。
+6. 与 B0 和 D1 已有结果做阶段性比较。
 
-### 11.3 是否迁移到 Person-in-WiFi 3D
+### 11.2 是否迁移到 Person-in-WiFi 3D
 
 迁移条件建议设为：
 
 ```text
-MMFi 上 D4 相比 B0-repeat 至少稳定提升 5%；
-D3-shuffled 明显低于 D4；
+MMFi 上 D4 相比当前 B0 至少稳定提升 5%；
+主要收益不是只来自某一个 early checkpoint；
 不同 seed 下趋势一致；
 best 和 final 不出现严重背离。
 ```
@@ -928,5 +1003,7 @@ B0 best = 242.56
 teacher token 没有足够强地约束主 3D 预测路径。
 ```
 
-下一步不应简单调参或直接扩大到 Person-in-WiFi 3D，而应先做对照实验确认 D1 的真实贡献，然后把蒸馏从独立辅助分支改为主 decoder/query 路径上的结构蒸馏。
-
+```text
+D1 已可判定为无效。
+下一步直接做 D4 主路径耦合蒸馏，并缩短训练周期。
+```
