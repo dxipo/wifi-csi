@@ -86,6 +86,13 @@ class PETRHead(AnchorFreeHead):
                  loss_kpt_rpn=dict(type='mmdet.L2Loss', loss_weight=70.0),
                  loss_kpt_refine=dict(type='mmdet.L2Loss', loss_weight=70.0),
                  loss_oks_refine=dict(type='opera.OKSLoss', loss_weight=2.0),
+                 teacher_embed_dims=256,
+                 decoder_token_distill_weight=0.0,
+                 decoder_relation_distill_weight=0.0,
+                 rel_pose_loss_weight=0.0,
+                 bone_loss_weight=0.0,
+                 pelvis_indices=(11, 12),
+                 skeleton_edges=None,
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
                  **kwargs):
@@ -119,6 +126,20 @@ class PETRHead(AnchorFreeHead):
         self.as_two_stage = as_two_stage
         self.with_kpt_refine = with_kpt_refine
         self.num_keypoints = num_keypoints
+        self.teacher_embed_dims = teacher_embed_dims
+        self.decoder_token_distill_weight = decoder_token_distill_weight
+        self.decoder_relation_distill_weight = decoder_relation_distill_weight
+        self.rel_pose_loss_weight = rel_pose_loss_weight
+        self.bone_loss_weight = bone_loss_weight
+        self.pelvis_indices = pelvis_indices
+        if skeleton_edges is None:
+            skeleton_edges = (
+                (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7),
+                (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),
+                (11, 12), (11, 13), (13, 15), (12, 14), (14, 16))
+        self.skeleton_edges = tuple(
+            (int(src), int(dst)) for src, dst in skeleton_edges
+            if src < num_keypoints and dst < num_keypoints)
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
         else:
@@ -141,6 +162,13 @@ class PETRHead(AnchorFreeHead):
             positional_encoding)
         self.transformer = build_transformer(transformer)
         self.embed_dims = self.transformer.embed_dims
+        if self.embed_dims == self.teacher_embed_dims:
+            self.decoder_student_projector = nn.Identity()
+        else:
+            self.decoder_student_projector = Linear(
+                self.embed_dims, self.teacher_embed_dims)
+        self.decoder_student_norm = nn.LayerNorm(self.teacher_embed_dims)
+        self.decoder_teacher_norm = nn.LayerNorm(self.teacher_embed_dims)
         assert 'num_feats' in positional_encoding
         num_feats = positional_encoding['num_feats']
         assert num_feats * 2 == self.embed_dims, 'embed_dims should' \
@@ -200,6 +228,9 @@ class PETRHead(AnchorFreeHead):
             bias_init = bias_init_with_prob(0.01)
             for m in self.cls_branches:
                 nn.init.constant_(m.bias, bias_init)
+        if isinstance(self.decoder_student_projector, Linear):
+            nn.init.xavier_uniform_(self.decoder_student_projector.weight)
+            nn.init.constant_(self.decoder_student_projector.bias, 0)
         for m in self.kpt_branches:
             constant_init(m[-1], 0, bias=0)
         # initialization of keypoint refinement branch
@@ -292,7 +323,7 @@ class PETRHead(AnchorFreeHead):
             raise RuntimeError('only "as_two_stage=True" is supported.')
 
     def forward_refine(self, memory, refine_targets, losses,
-                       img_metas):
+                       img_metas, teacher_tokens=None):
         """Forward function.
 
         Args:
@@ -312,8 +343,8 @@ class PETRHead(AnchorFreeHead):
             pos_img_inds = kpt_preds.new_zeros([1], dtype=torch.int64)
         else:
             pos_kpt_preds = kpt_preds[pos_inds]
-            pos_img_inds = (pos_inds.nonzero() / self.num_query).squeeze(1).to(
-                torch.int64)
+            pos_img_inds = (pos_inds.nonzero(as_tuple=False).squeeze(1) //
+                            self.num_query).to(torch.int64)
         hs, init_reference, inter_references = self.transformer.forward_refine(
             memory,
             pos_kpt_preds.detach(),
@@ -334,6 +365,18 @@ class PETRHead(AnchorFreeHead):
             outputs_kpt = tmp_kpt
             outputs_kpts.append(outputs_kpt)
         outputs_kpts = torch.stack(outputs_kpts)
+        pos_kpt_weights = kpt_weights[pos_inds]
+        pos_kpt_targets = kpt_targets[pos_inds]
+
+        if teacher_tokens is not None:
+            losses.update(
+                self.loss_main_path_distill(
+                    refine_tokens=hs[-1],
+                    teacher_tokens=teacher_tokens,
+                    pos_img_inds=pos_img_inds,
+                    pred_kpts=outputs_kpts[-1],
+                    target_kpts=pos_kpt_targets,
+                    has_pos=pos_inds.sum() > 0))
 
         if not self.training:
             return outputs_kpts
@@ -342,8 +385,6 @@ class PETRHead(AnchorFreeHead):
             reduce_mean(kpt_weights.sum()), min=1).item()
         num_total_pos = kpt_weights.new_tensor([outputs_kpts.size(1)])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
-        pos_kpt_weights = kpt_weights[pos_inds]
-        pos_kpt_targets = kpt_targets[pos_inds]
 
         for i, kpt_refine_preds in enumerate(outputs_kpts):
             if pos_inds.sum() == 0:
@@ -372,6 +413,7 @@ class PETRHead(AnchorFreeHead):
                       gt_areas=None,
                       gt_bboxes_ignore=None,
                       proposal_cfg=None,
+                      teacher_tokens=None,
                       **kwargs):
         """Forward function for training mode.
 
@@ -409,8 +451,118 @@ class PETRHead(AnchorFreeHead):
         losses, refine_targets = losses_and_targets
         # get pose refinement loss
         losses = self.forward_refine(memory, refine_targets,
-                                     losses, img_metas)
+                                     losses, img_metas,
+                                     teacher_tokens=teacher_tokens)
         return losses
+
+    def loss_main_path_distill(self,
+                               refine_tokens,
+                               teacher_tokens,
+                               pos_img_inds,
+                               pred_kpts,
+                               target_kpts,
+                               has_pos=True):
+        """Distill 2D-skeleton teacher knowledge into main refine tokens."""
+        losses = {}
+        zero = refine_tokens.sum() * 0
+        if not has_pos:
+            if self.decoder_token_distill_weight > 0:
+                losses['loss_decoder_token_distill'] = zero
+            if self.decoder_relation_distill_weight > 0:
+                losses['loss_decoder_relation_distill'] = zero
+            if self.rel_pose_loss_weight > 0:
+                losses['loss_pose_rel_gt'] = zero
+            if self.bone_loss_weight > 0:
+                losses['loss_bone_gt'] = zero
+            losses['distill_main_token_cos'] = zero.detach()
+            return losses
+
+        if (self.decoder_token_distill_weight > 0 or
+                self.decoder_relation_distill_weight > 0):
+            teacher_tokens = self._stack_teacher_tokens(
+                teacher_tokens, refine_tokens.device)
+            if teacher_tokens.dim() == 2:
+                teacher_tokens = teacher_tokens.unsqueeze(0)
+            if teacher_tokens.size(1) == self.num_keypoints + 1:
+                teacher_joint_tokens = teacher_tokens[:, 1:]
+            elif teacher_tokens.size(1) == self.num_keypoints:
+                teacher_joint_tokens = teacher_tokens
+            else:
+                raise ValueError(
+                    f'Expected teacher token count {self.num_keypoints} or '
+                    f'{self.num_keypoints + 1}, got {teacher_tokens.size(1)}')
+            teacher_joint_tokens = teacher_joint_tokens[pos_img_inds].detach()
+
+            student = self.decoder_student_projector(refine_tokens)
+            student = self.decoder_student_norm(student)
+            teacher = self.decoder_teacher_norm(teacher_joint_tokens)
+
+            if self.decoder_token_distill_weight > 0:
+                losses['loss_decoder_token_distill'] = (
+                    F.smooth_l1_loss(student, teacher, reduction='mean') *
+                    self.decoder_token_distill_weight)
+            if self.decoder_relation_distill_weight > 0:
+                losses['loss_decoder_relation_distill'] = (
+                    F.mse_loss(
+                        self.token_relation(student),
+                        self.token_relation(teacher),
+                        reduction='mean') *
+                    self.decoder_relation_distill_weight)
+            losses['distill_main_token_cos'] = F.cosine_similarity(
+                student.flatten(1), teacher.flatten(1), dim=1).mean().detach()
+
+        target = target_kpts.reshape(-1, self.num_keypoints, 3)
+        if self.rel_pose_loss_weight > 0:
+            pred_rel = pred_kpts - self.pelvis(pred_kpts)
+            target_rel = target - self.pelvis(target)
+            losses['loss_pose_rel_gt'] = (
+                F.smooth_l1_loss(pred_rel, target_rel, reduction='mean') *
+                self.rel_pose_loss_weight)
+
+        if self.bone_loss_weight > 0:
+            losses['loss_bone_gt'] = (
+                self.bone_loss(pred_kpts, target) * self.bone_loss_weight)
+
+        return losses
+
+    @staticmethod
+    def _stack_teacher_tokens(teacher_tokens, device):
+        if isinstance(teacher_tokens, (list, tuple)):
+            if len(teacher_tokens) == 1 and isinstance(teacher_tokens[0], (list, tuple)):
+                teacher_tokens = teacher_tokens[0]
+            teacher_tokens = torch.stack(
+                [x if torch.is_tensor(x) else torch.as_tensor(x)
+                 for x in teacher_tokens],
+                dim=0)
+        return teacher_tokens.to(device=device, dtype=torch.float32)
+
+    @staticmethod
+    def token_relation(tokens, eps=1e-6):
+        tokens = F.normalize(tokens, dim=-1, eps=eps)
+        return torch.matmul(tokens, tokens.transpose(1, 2))
+
+    def pelvis(self, keypoints):
+        left, right = self.pelvis_indices
+        if left < keypoints.size(1) and right < keypoints.size(1):
+            return ((keypoints[:, left] + keypoints[:, right]) * 0.5).unsqueeze(1)
+        return keypoints.mean(dim=1, keepdim=True)
+
+    def bone_loss(self, pred, target, eps=1e-6):
+        if not self.skeleton_edges:
+            return pred.sum() * 0
+        src = pred.new_tensor(
+            [edge[0] for edge in self.skeleton_edges], dtype=torch.long)
+        dst = pred.new_tensor(
+            [edge[1] for edge in self.skeleton_edges], dtype=torch.long)
+        pred_bones = pred[:, dst] - pred[:, src]
+        target_bones = target[:, dst] - target[:, src]
+        pred_dir = F.normalize(pred_bones, dim=-1, eps=eps)
+        target_dir = F.normalize(target_bones, dim=-1, eps=eps)
+        dir_loss = F.smooth_l1_loss(pred_dir, target_dir, reduction='mean')
+        pred_len = pred_bones.norm(dim=-1)
+        target_len = target_bones.norm(dim=-1)
+        len_loss = F.smooth_l1_loss(pred_len, target_len, reduction='mean')
+        return dir_loss + 0.2 * len_loss
 
     @force_fp32(apply_to=('all_cls_scores', 'all_kpt_preds'))
     def loss(self,

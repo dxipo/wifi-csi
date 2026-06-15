@@ -28,6 +28,7 @@ class PETR(DETR):
                  input_stem='linear',
                  stem_in_channels=6,
                  stem_hidden_channels=64,
+                 stem_mid_channels=128,
                  stem_out_channels=256,
                  **kwargs):
         super(DETR, self).__init__(*args, **kwargs)
@@ -50,6 +51,32 @@ class PETR(DETR):
                     kernel_size=1,
                     bias=True),
                 nn.ReLU(inplace=True))
+        elif input_stem == 'conv2d_3layer':
+            self.head = nn.Sequential(
+                nn.Conv2d(
+                    stem_in_channels,
+                    stem_hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(stem_hidden_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(
+                    stem_hidden_channels,
+                    stem_mid_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(stem_mid_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(
+                    stem_mid_channels,
+                    stem_out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(stem_out_channels),
+                nn.ReLU(inplace=True))
         else:
             raise ValueError(f'Unsupported PETR input_stem: {input_stem}')
 
@@ -59,7 +86,7 @@ class PETR(DETR):
             channel = img.shape[-1]
             x = img.reshape(bs, -1, channel)
             return self.head(x)
-        if self.input_stem == 'conv2d':
+        if self.input_stem in ('conv2d', 'conv2d_3layer'):
             if img.dim() != 4:
                 raise ValueError(
                     f'conv2d input_stem expects 4D CSI tensor, got {img.shape}')
@@ -74,6 +101,7 @@ class PETR(DETR):
                       gt_labels,
                       gt_keypoints,
                       gt_areas,
+                      teacher_tokens=None,
                       gt_bboxes_ignore=None):
         """
         Args:
@@ -102,7 +130,8 @@ class PETR(DETR):
         x = self.extract_csi_tokens(img)
         losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
                                               gt_labels, gt_keypoints,
-                                              gt_areas, gt_bboxes_ignore)
+                                              gt_areas, gt_bboxes_ignore,
+                                              teacher_tokens=teacher_tokens)
         return losses
 
     def forward_dummy(self, img):
