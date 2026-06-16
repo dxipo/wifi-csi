@@ -366,9 +366,9 @@ class PETRHead(AnchorFreeHead):
             outputs_kpts.append(outputs_kpt)
         outputs_kpts = torch.stack(outputs_kpts)
         pos_kpt_weights = kpt_weights[pos_inds]
-        pos_kpt_targets = kpt_targets[pos_inds]
+        pos_kpt_targets = None if kpt_targets is None else kpt_targets[pos_inds]
 
-        if teacher_tokens is not None:
+        if teacher_tokens is not None and pos_kpt_targets is not None:
             losses.update(
                 self.loss_main_path_distill(
                     refine_tokens=hs[-1],
