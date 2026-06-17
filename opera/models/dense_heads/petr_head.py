@@ -91,6 +91,10 @@ class PETRHead(AnchorFreeHead):
                  decoder_relation_distill_weight=0.0,
                  rel_pose_loss_weight=0.0,
                  bone_loss_weight=0.0,
+                 root_decoupled=False,
+                 root_pose_loss_weight=0.0,
+                 axis_pose_loss_weight=0.0,
+                 axis_loss_weights=(1.0, 1.0, 1.0),
                  pelvis_indices=(11, 12),
                  skeleton_edges=None,
                  test_cfg=dict(max_per_img=100),
@@ -131,6 +135,10 @@ class PETRHead(AnchorFreeHead):
         self.decoder_relation_distill_weight = decoder_relation_distill_weight
         self.rel_pose_loss_weight = rel_pose_loss_weight
         self.bone_loss_weight = bone_loss_weight
+        self.root_decoupled = root_decoupled
+        self.root_pose_loss_weight = root_pose_loss_weight
+        self.axis_pose_loss_weight = axis_pose_loss_weight
+        self.axis_loss_weights = tuple(float(x) for x in axis_loss_weights)
         self.pelvis_indices = pelvis_indices
         if skeleton_edges is None:
             skeleton_edges = (
@@ -219,6 +227,13 @@ class PETRHead(AnchorFreeHead):
         if self.with_kpt_refine:
             num_pred = self.transformer.refine_decoder.num_layers
             self.refine_kpt_branches = _get_clones(refine_kpt_branch, num_pred)
+            if self.root_decoupled:
+                root_branch = []
+                root_branch.append(Linear(self.embed_dims, self.embed_dims))
+                root_branch.append(nn.ReLU())
+                root_branch.append(Linear(self.embed_dims, 3))
+                self.refine_root_branches = _get_clones(
+                    nn.Sequential(*root_branch), num_pred)
         self.fc_hm = Linear(self.embed_dims, self.num_keypoints)
 
     def init_weights(self):
@@ -237,6 +252,9 @@ class PETRHead(AnchorFreeHead):
         if self.with_kpt_refine:
             for m in self.refine_kpt_branches:
                 constant_init(m[-1], 0, bias=0)
+            if self.root_decoupled:
+                for m in self.refine_root_branches:
+                    constant_init(m[-1], 0, bias=0)
         # initialize bias for heatmap prediction
         bias_init = bias_init_with_prob(0.1)
         normal_init(self.fc_hm, std=0.01, bias=bias_init)
@@ -362,7 +380,13 @@ class PETRHead(AnchorFreeHead):
             tmp_kpt = self.refine_kpt_branches[lvl](hs[lvl])
             assert reference.shape[-1] == 3
             tmp_kpt += reference
-            outputs_kpt = tmp_kpt
+            if self.root_decoupled:
+                root_offset = self.refine_root_branches[lvl](
+                    hs[lvl].mean(dim=1)).unsqueeze(1)
+                root_base = self.pelvis(tmp_kpt)
+                outputs_kpt = (tmp_kpt - root_base) + (root_base + root_offset)
+            else:
+                outputs_kpt = tmp_kpt
             outputs_kpts.append(outputs_kpt)
         outputs_kpts = torch.stack(outputs_kpts)
         pos_kpt_weights = kpt_weights[pos_inds]
@@ -474,6 +498,10 @@ class PETRHead(AnchorFreeHead):
                 losses['loss_pose_rel_gt'] = zero
             if self.bone_loss_weight > 0:
                 losses['loss_bone_gt'] = zero
+            if self.root_pose_loss_weight > 0:
+                losses['loss_root_gt'] = zero
+            if self.axis_pose_loss_weight > 0:
+                losses['loss_axis_gt'] = zero
             losses['distill_main_token_cos'] = zero.detach()
             return losses
 
@@ -522,6 +550,30 @@ class PETRHead(AnchorFreeHead):
         if self.bone_loss_weight > 0:
             losses['loss_bone_gt'] = (
                 self.bone_loss(pred_kpts, target) * self.bone_loss_weight)
+
+        if self.root_pose_loss_weight > 0:
+            pred_root = self.pelvis(pred_kpts)
+            target_root = self.pelvis(target)
+            losses['loss_root_gt'] = (
+                F.smooth_l1_loss(pred_root, target_root, reduction='mean') *
+                self.root_pose_loss_weight)
+            root_abs_error = (pred_root - target_root).abs().mean(dim=(0, 1))
+            losses['root_abs_x'] = root_abs_error[0].detach()
+            losses['root_abs_y'] = root_abs_error[1].detach()
+            losses['root_abs_z'] = root_abs_error[2].detach()
+
+        if self.axis_pose_loss_weight > 0:
+            axis_weights = pred_kpts.new_tensor(
+                self.axis_loss_weights).view(1, 1, 3)
+            axis_error = F.smooth_l1_loss(
+                pred_kpts, target, reduction='none')
+            losses['loss_axis_gt'] = (
+                (axis_error * axis_weights).mean() *
+                self.axis_pose_loss_weight)
+            axis_abs_error = (pred_kpts - target).abs().mean(dim=(0, 1))
+            losses['axis_abs_x'] = axis_abs_error[0].detach()
+            losses['axis_abs_y'] = axis_abs_error[1].detach()
+            losses['axis_abs_z'] = axis_abs_error[2].detach()
 
         return losses
 
