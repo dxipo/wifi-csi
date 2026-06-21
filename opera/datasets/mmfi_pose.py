@@ -119,6 +119,19 @@ class MMFiPoseDataset(dataset):
                  normalize_csi=True,
                  preprocess='raw',
                  origin_linear_layout='time_token',
+                 sdp_context_radius=7,
+                 sdp_window_size=8,
+                 sdp_stride=3,
+                 sdp_n_delta=6,
+                 sdp_layout='lagwindow',
+                 sdp_use_hampel=True,
+                 sdp_hampel_window=2,
+                 sdp_hampel_sigma=3.0,
+                 sdp_use_moving_average=True,
+                 sdp_ma_window=3,
+                 sdp_acf_unbiased=False,
+                 sdp_positive_clip=True,
+                 sdp_zero_column_fill='uniform',
                  return_pose2d=False,
                  pose2d_window=9,
                  pose2d_normalize=True,
@@ -144,6 +157,20 @@ class MMFiPoseDataset(dataset):
         self.normalize_csi = normalize_csi
         self.preprocess = preprocess
         self.origin_linear_layout = origin_linear_layout
+        self.sdp_cfg = dict(
+            context_radius=sdp_context_radius,
+            window_size=sdp_window_size,
+            stride=sdp_stride,
+            n_delta=sdp_n_delta,
+            layout=sdp_layout,
+            use_hampel=sdp_use_hampel,
+            hampel_window=sdp_hampel_window,
+            hampel_sigma=sdp_hampel_sigma,
+            use_moving_average=sdp_use_moving_average,
+            ma_window=sdp_ma_window,
+            acf_unbiased=sdp_acf_unbiased,
+            positive_clip=sdp_positive_clip,
+            zero_column_fill=sdp_zero_column_fill)
         self.return_pose2d = return_pose2d
         self.pose2d_window = pose2d_window
         self.pose2d_normalize = pose2d_normalize
@@ -208,7 +235,10 @@ class MMFiPoseDataset(dataset):
 
     def prepare_sample(self, index):
         info = self.data_infos[index]
-        csi = self.load_csi(info['csi_path'])
+        if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike'):
+            csi = self.load_sdp_imagelike(info)
+        else:
+            csi = self.load_csi(info['csi_path'])
         keypoint = np.load(info['gt_path'])[info['frame_idx']].astype(np.float32)
         keypoint = torch.from_numpy(keypoint[None, ...]).float()
 
@@ -236,6 +266,10 @@ class MMFiPoseDataset(dataset):
         if self.preprocess == 'origin':
             csi = self.load_origin_style_csi(mat)
             return torch.from_numpy(csi).float()
+        if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike'):
+            raise ValueError(
+                'SDP image preprocessing requires load_sdp_imagelike(info), '
+                'not load_csi(csi_path).')
         if self.preprocess != 'raw':
             raise ValueError(f'Unsupported MMFi CSI preprocess: {self.preprocess}')
 
@@ -246,6 +280,147 @@ class MMFiPoseDataset(dataset):
             features.append(self.clean_csi(phase))
         csi = np.concatenate(features, axis=0)
         return torch.from_numpy(csi).float()
+
+    def load_sdp_imagelike(self, info):
+        amp = self.load_centered_amp_window(info)
+        sdp = self.extract_sdp_imagelike_from_amp(amp)
+        if self.normalize_csi:
+            sdp = self.normalize_feature(sdp)
+        return torch.from_numpy(np.ascontiguousarray(sdp)).float()
+
+    def load_centered_amp_window(self, info):
+        radius = int(self.sdp_cfg['context_radius'])
+        action_dir = os.path.join(self.data_root, info['scene'], info['subject'],
+                                  info['action'])
+        csi_dir = os.path.join(action_dir, 'wifi-csi')
+        gt = np.load(info['gt_path'], mmap_mode='r')
+        num_frames = gt.shape[0]
+        frames = []
+        for offset in range(-radius, radius + 1):
+            frame_idx = int(np.clip(info['frame_idx'] + offset, 0,
+                                    num_frames - 1))
+            csi_path = os.path.join(csi_dir, f'frame{frame_idx + 1:03d}.mat')
+            if not os.path.exists(csi_path) or os.path.getsize(csi_path) == 0:
+                csi_path = info['csi_path']
+            mat = scio.loadmat(csi_path)
+            amp = mat['CSIamp'].astype(np.float32)
+            frames.append(self.replace_invalid(amp))
+        return np.concatenate(frames, axis=-1).astype(np.float32)
+
+    def extract_sdp_imagelike_from_amp(self, amp):
+        if amp.ndim != 3:
+            raise ValueError(
+                f'MMFi SDP image expects amplitude shape (C,Subcarrier,T), got {amp.shape}')
+        channels, subcarriers, time_len = amp.shape
+        window_size = int(self.sdp_cfg['window_size'])
+        stride = int(self.sdp_cfg['stride'])
+        n_delta = int(self.sdp_cfg['n_delta'])
+        if n_delta >= window_size:
+            raise ValueError(
+                f'sdp_n_delta={n_delta} must be < sdp_window_size={window_size}')
+        if window_size > time_len:
+            raise ValueError(
+                f'sdp_window_size={window_size} > time length={time_len}')
+
+        window_starts = list(range(0, time_len - window_size + 1, stride))
+        out = np.zeros((channels, subcarriers, n_delta * len(window_starts)),
+                       dtype=np.float32)
+
+        for channel in range(channels):
+            acf = np.zeros((subcarriers, len(window_starts), n_delta),
+                           dtype=np.float32)
+            for sc in range(subcarriers):
+                series = amp[channel, sc].astype(np.float32)
+                series = self.preprocess_sdp_series(series)
+                for win_idx, start in enumerate(window_starts):
+                    acf[sc, win_idx] = self.compute_acf_for_series(
+                        series[start:start + window_size],
+                        n_delta=n_delta,
+                        unbiased=self.sdp_cfg['acf_unbiased'])
+            acf = self.normalize_sdp_lag_columns(
+                acf,
+                positive_clip=self.sdp_cfg['positive_clip'],
+                zero_column_fill=self.sdp_cfg['zero_column_fill'])
+            if self.sdp_cfg['layout'] == 'lagwindow':
+                out[channel] = np.transpose(acf, (0, 2, 1)).reshape(
+                    subcarriers, -1)
+            elif self.sdp_cfg['layout'] == 'windowlag':
+                out[channel] = acf.reshape(subcarriers, -1)
+            else:
+                raise ValueError(f"Unsupported sdp_layout={self.sdp_cfg['layout']}")
+
+        return out.astype(np.float32)
+
+    def preprocess_sdp_series(self, x):
+        y = np.asarray(x, dtype=np.float32)
+        if self.sdp_cfg['use_hampel']:
+            y = self.hampel_filter_1d(
+                y,
+                window=int(self.sdp_cfg['hampel_window']),
+                sigma=float(self.sdp_cfg['hampel_sigma']))
+        if self.sdp_cfg['use_moving_average']:
+            y = self.moving_average_1d(
+                y, window=int(self.sdp_cfg['ma_window']))
+        return np.square(y).astype(np.float32)
+
+    @staticmethod
+    def hampel_filter_1d(x, window=2, sigma=3.0, eps=1e-8):
+        x = np.asarray(x, dtype=np.float32)
+        y = x.copy()
+        for idx in range(len(x)):
+            left = max(0, idx - window)
+            right = min(len(x), idx + window + 1)
+            win = x[left:right]
+            med = np.median(win)
+            mad = np.median(np.abs(win - med))
+            scale = max(1.4826 * mad, eps)
+            if abs(x[idx] - med) > sigma * scale:
+                y[idx] = med
+        return y
+
+    @staticmethod
+    def moving_average_1d(x, window=3):
+        x = np.asarray(x, dtype=np.float32)
+        if window <= 1 or len(x) < 2:
+            return x.copy()
+        width = min(window, len(x))
+        kernel = np.ones(width, dtype=np.float32) / float(width)
+        return np.convolve(x, kernel, mode='same').astype(np.float32)
+
+    @staticmethod
+    def compute_acf_for_series(series, n_delta, unbiased=False, eps=1e-8):
+        x = np.asarray(series, dtype=np.float32)
+        x = x - x.mean()
+        var = np.var(x)
+        if var < eps:
+            return np.zeros((n_delta,), dtype=np.float32)
+        acf = np.zeros((n_delta,), dtype=np.float32)
+        for lag in range(1, n_delta + 1):
+            denom = (len(x) - lag) if unbiased else len(x)
+            val = np.sum(x[lag:] * x[:-lag]) / max(float(denom), eps)
+            acf[lag - 1] = val / max(float(var), eps)
+        return acf
+
+    @staticmethod
+    def normalize_sdp_lag_columns(acf,
+                                  positive_clip=True,
+                                  zero_column_fill='uniform',
+                                  eps=1e-8):
+        x = np.asarray(acf, dtype=np.float32).copy()
+        if positive_clip:
+            x = np.maximum(x, 0.0)
+        col_sum = x.sum(axis=-1, keepdims=True)
+        zero_mask = col_sum < eps
+        if np.any(zero_mask):
+            if zero_column_fill == 'uniform':
+                x = np.where(zero_mask, 1.0 / x.shape[-1], x)
+                col_sum = np.where(zero_mask, 1.0, col_sum)
+            elif zero_column_fill == 'zeros':
+                col_sum = np.where(zero_mask, 1.0, col_sum)
+            else:
+                raise ValueError(
+                    f'Unsupported zero_column_fill={zero_column_fill}')
+        return (x / col_sum).astype(np.float32)
 
     def load_pose2d_sequence(self, info):
         if self.pose2d_window % 2 != 1:

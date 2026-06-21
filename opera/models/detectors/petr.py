@@ -30,11 +30,28 @@ class PETR(DETR):
                  stem_hidden_channels=64,
                  stem_mid_channels=128,
                  stem_out_channels=256,
+                 patch_kernel_size=(3, 25),
+                 patch_stride=None,
+                 patch_padding=0,
+                 patch_out_dim=256,
                  **kwargs):
         super(DETR, self).__init__(*args, **kwargs)
         self.input_stem = input_stem
         if input_stem == 'linear':
             self.head = Linear(input_dim, stem_out_channels)
+        elif input_stem == 'conv_patch':
+            if patch_stride is None:
+                patch_stride = patch_kernel_size
+            self.head = nn.Sequential(
+                nn.Conv2d(
+                    stem_in_channels,
+                    patch_out_dim,
+                    kernel_size=tuple(patch_kernel_size),
+                    stride=tuple(patch_stride),
+                    padding=patch_padding,
+                    bias=False),
+                nn.BatchNorm2d(patch_out_dim),
+                nn.ReLU(inplace=True))
         elif input_stem == 'conv2d':
             self.head = nn.Sequential(
                 nn.Conv2d(
@@ -86,10 +103,10 @@ class PETR(DETR):
             channel = img.shape[-1]
             x = img.reshape(bs, -1, channel)
             return self.head(x)
-        if self.input_stem in ('conv2d', 'conv2d_3layer'):
+        if self.input_stem in ('conv2d', 'conv2d_3layer', 'conv_patch'):
             if img.dim() != 4:
                 raise ValueError(
-                    f'conv2d input_stem expects 4D CSI tensor, got {img.shape}')
+                    f'{self.input_stem} input_stem expects 4D CSI tensor, got {img.shape}')
             feat = self.head(img)
             return feat.flatten(2).transpose(1, 2).contiguous()
         raise RuntimeError(f'Unsupported PETR input_stem: {self.input_stem}')
