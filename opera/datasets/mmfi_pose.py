@@ -142,6 +142,9 @@ class MMFiPoseDataset(dataset):
                  strict_teacher_tokens=True,
                  shuffle_teacher_tokens=False,
                  shuffle_teacher_seed=42,
+                 sdp_offline_dir=None,
+                 sdp_offline_ext='.npy',
+                 strict_sdp_offline=True,
                  max_samples=None,
                  subjects=None,
                  actions=None,
@@ -181,6 +184,9 @@ class MMFiPoseDataset(dataset):
         self.strict_teacher_tokens = strict_teacher_tokens
         self.shuffle_teacher_tokens = shuffle_teacher_tokens
         self.shuffle_teacher_seed = shuffle_teacher_seed
+        self.sdp_offline_dir = sdp_offline_dir
+        self.sdp_offline_ext = sdp_offline_ext
+        self.strict_sdp_offline = strict_sdp_offline
         self.max_samples = max_samples
         self.subject_action_map = build_subject_action_map(
             protocol=protocol,
@@ -237,6 +243,8 @@ class MMFiPoseDataset(dataset):
         info = self.data_infos[index]
         if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike'):
             csi = self.load_sdp_imagelike(info)
+        elif self.preprocess == 'sdp_imagelike_offline':
+            csi = self.load_sdp_imagelike_offline(info)
         else:
             csi = self.load_csi(info['csi_path'])
         keypoint = np.load(info['gt_path'])[info['frame_idx']].astype(np.float32)
@@ -266,7 +274,8 @@ class MMFiPoseDataset(dataset):
         if self.preprocess == 'origin':
             csi = self.load_origin_style_csi(mat)
             return torch.from_numpy(csi).float()
-        if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike'):
+        if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike',
+                               'sdp_imagelike_offline'):
             raise ValueError(
                 'SDP image preprocessing requires load_sdp_imagelike(info), '
                 'not load_csi(csi_path).')
@@ -287,6 +296,24 @@ class MMFiPoseDataset(dataset):
         if self.normalize_csi:
             sdp = self.normalize_feature(sdp)
         return torch.from_numpy(np.ascontiguousarray(sdp)).float()
+
+    def load_sdp_imagelike_offline(self, info):
+        if self.sdp_offline_dir is None:
+            raise ValueError('sdp_offline_dir must be set for offline SDP input.')
+        sdp_path = os.path.join(
+            self.sdp_offline_dir,
+            self.sdp_offline_filename(info) + self.sdp_offline_ext)
+        if not os.path.exists(sdp_path):
+            if self.strict_sdp_offline:
+                raise FileNotFoundError(f'Missing offline SDP file: {sdp_path}')
+            return self.load_sdp_imagelike(info)
+        data = np.load(sdp_path)
+        if isinstance(data, np.lib.npyio.NpzFile):
+            sdp = data[data.files[0]]
+        else:
+            sdp = data
+        return torch.from_numpy(
+            np.ascontiguousarray(sdp.astype(np.float32))).float()
 
     def load_centered_amp_window(self, info):
         radius = int(self.sdp_cfg['context_radius'])
@@ -508,6 +535,10 @@ class MMFiPoseDataset(dataset):
 
     @staticmethod
     def teacher_token_filename(info):
+        return info['sample_id'].replace('/', '__')
+
+    @staticmethod
+    def sdp_offline_filename(info):
         return info['sample_id'].replace('/', '__')
 
     def load_origin_style_csi(self, mat):
