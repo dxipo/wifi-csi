@@ -34,6 +34,13 @@ lr_config = dict(policy='step', step=[4])
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 checkpoint_config = dict(interval=1, max_keep_ckpts=6)
+custom_hooks = [
+    dict(type='NumClassCheckHook'),
+    dict(
+        type='FreezeExceptHook',
+        trainable_param_prefixes=['bbox_head.refine_root_branches'],
+        trainable_module_prefixes=['bbox_head.refine_root_branches'])
+]
 work_dir = 'result/mmfi_d6_freeze_root_adapter'
 load_from = 'result/mmfi_b0_3d_baseline/best_mpjpe_epoch_10.pth'
 resume_from = None
