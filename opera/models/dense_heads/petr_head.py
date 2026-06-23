@@ -392,6 +392,13 @@ class PETRHead(AnchorFreeHead):
         pos_kpt_weights = kpt_weights[pos_inds]
         pos_kpt_targets = None if kpt_targets is None else kpt_targets[pos_inds]
 
+        if pos_kpt_targets is not None:
+            losses.update(
+                self.loss_pose_gt_regularization(
+                    pred_kpts=outputs_kpts[-1],
+                    target_kpts=pos_kpt_targets,
+                    has_pos=pos_inds.sum() > 0))
+
         if teacher_tokens is not None and pos_kpt_targets is not None:
             losses.update(
                 self.loss_main_path_distill(
@@ -494,14 +501,6 @@ class PETRHead(AnchorFreeHead):
                 losses['loss_decoder_token_distill'] = zero
             if self.decoder_relation_distill_weight > 0:
                 losses['loss_decoder_relation_distill'] = zero
-            if self.rel_pose_loss_weight > 0:
-                losses['loss_pose_rel_gt'] = zero
-            if self.bone_loss_weight > 0:
-                losses['loss_bone_gt'] = zero
-            if self.root_pose_loss_weight > 0:
-                losses['loss_root_gt'] = zero
-            if self.axis_pose_loss_weight > 0:
-                losses['loss_axis_gt'] = zero
             losses['distill_main_token_cos'] = zero.detach()
             return losses
 
@@ -539,6 +538,27 @@ class PETRHead(AnchorFreeHead):
             losses['distill_main_token_cos'] = F.cosine_similarity(
                 student.flatten(1), teacher.flatten(1), dim=1).mean().detach()
 
+        return losses
+
+    def loss_pose_gt_regularization(self,
+                                    pred_kpts,
+                                    target_kpts,
+                                    has_pos=True):
+        """Apply GT-based pose regularization on the main refine prediction."""
+        losses = {}
+        zero = pred_kpts.sum() * 0
+        if not has_pos:
+            if self.rel_pose_loss_weight > 0:
+                losses['loss_pose_rel_gt'] = zero
+            if self.bone_loss_weight > 0:
+                losses['loss_bone_gt'] = zero
+            if self.root_pose_loss_weight > 0:
+                losses['loss_root_gt'] = zero
+            if self.axis_pose_loss_weight > 0:
+                losses['loss_axis_gt'] = zero
+            return losses
+
+        pred_kpts = pred_kpts.reshape(-1, self.num_keypoints, 3)
         target = target_kpts.reshape(-1, self.num_keypoints, 3)
         if self.rel_pose_loss_weight > 0:
             pred_rel = pred_kpts - self.pelvis(pred_kpts)
