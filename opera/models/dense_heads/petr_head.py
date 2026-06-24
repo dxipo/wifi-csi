@@ -92,6 +92,8 @@ class PETRHead(AnchorFreeHead):
                  rel_pose_loss_weight=0.0,
                  bone_loss_weight=0.0,
                  root_decoupled=False,
+                 root_relative_decoupled=False,
+                 root_relative_detach_base=True,
                  root_pose_loss_weight=0.0,
                  axis_pose_loss_weight=0.0,
                  axis_loss_weights=(1.0, 1.0, 1.0),
@@ -136,6 +138,8 @@ class PETRHead(AnchorFreeHead):
         self.rel_pose_loss_weight = rel_pose_loss_weight
         self.bone_loss_weight = bone_loss_weight
         self.root_decoupled = root_decoupled
+        self.root_relative_decoupled = root_relative_decoupled
+        self.root_relative_detach_base = root_relative_detach_base
         self.root_pose_loss_weight = root_pose_loss_weight
         self.axis_pose_loss_weight = axis_pose_loss_weight
         self.axis_loss_weights = tuple(float(x) for x in axis_loss_weights)
@@ -227,7 +231,7 @@ class PETRHead(AnchorFreeHead):
         if self.with_kpt_refine:
             num_pred = self.transformer.refine_decoder.num_layers
             self.refine_kpt_branches = _get_clones(refine_kpt_branch, num_pred)
-            if self.root_decoupled:
+            if self.root_decoupled or self.root_relative_decoupled:
                 root_branch = []
                 root_branch.append(Linear(self.embed_dims, self.embed_dims))
                 root_branch.append(nn.ReLU())
@@ -252,7 +256,7 @@ class PETRHead(AnchorFreeHead):
         if self.with_kpt_refine:
             for m in self.refine_kpt_branches:
                 constant_init(m[-1], 0, bias=0)
-            if self.root_decoupled:
+            if self.root_decoupled or self.root_relative_decoupled:
                 for m in self.refine_root_branches:
                     constant_init(m[-1], 0, bias=0)
         # initialize bias for heatmap prediction
@@ -380,7 +384,16 @@ class PETRHead(AnchorFreeHead):
             tmp_kpt = self.refine_kpt_branches[lvl](hs[lvl])
             assert reference.shape[-1] == 3
             tmp_kpt += reference
-            if self.root_decoupled:
+            if self.root_relative_decoupled:
+                root_base = self.pelvis(tmp_kpt)
+                rel_pose = tmp_kpt - root_base
+                if self.root_relative_detach_base:
+                    root_base = root_base.detach()
+                root_offset = self.refine_root_branches[lvl](
+                    hs[lvl].mean(dim=1)).unsqueeze(1)
+                root_pred = root_base + root_offset
+                outputs_kpt = rel_pose + root_pred
+            elif self.root_decoupled:
                 root_offset = self.refine_root_branches[lvl](
                     hs[lvl].mean(dim=1)).unsqueeze(1)
                 root_base = self.pelvis(tmp_kpt)
@@ -546,6 +559,10 @@ class PETRHead(AnchorFreeHead):
             losses['loss_pose_rel_gt'] = (
                 F.smooth_l1_loss(pred_rel, target_rel, reduction='mean') *
                 self.rel_pose_loss_weight)
+            rel_abs_error = (pred_rel - target_rel).abs().mean(dim=(0, 1))
+            losses['rel_abs_x'] = rel_abs_error[0].detach()
+            losses['rel_abs_y'] = rel_abs_error[1].detach()
+            losses['rel_abs_z'] = rel_abs_error[2].detach()
 
         if self.bone_loss_weight > 0:
             losses['loss_bone_gt'] = (
