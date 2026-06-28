@@ -85,6 +85,9 @@ def build_subject_action_map(protocol='protocol2',
             seed += 1
         return result
 
+    if split_to_use == 'sample_random_split':
+        return {subject: protocol_actions for subject in ALL_SUBJECTS}
+
     if split_to_use == 'cross_scene_split':
         selected = ALL_SUBJECTS[:30] if split == 'train' else ALL_SUBJECTS[30:]
         return {subject: protocol_actions for subject in selected}
@@ -235,9 +238,26 @@ class MMFiPoseDataset(dataset):
                             csi_path=csi_path,
                             gt_path=gt_path,
                             sample_id=f'{scene}/{subject}/{action}/{frame_name}'))
-                    if self.max_samples is not None and len(infos) >= self.max_samples:
+                    if (self.max_samples is not None and
+                            self.split_to_use != 'sample_random_split' and
+                            len(infos) >= self.max_samples):
                         return infos
+        if self.split_to_use == 'sample_random_split':
+            infos = self.apply_sample_random_split(infos)
+        if self.max_samples is not None:
+            infos = infos[:self.max_samples]
         return infos
+
+    def apply_sample_random_split(self, infos):
+        if len(infos) == 0:
+            return infos
+        split = 'val' if self.mode in ('val', 'validation', 'test') else 'train'
+        rng = np.random.RandomState(self.random_seed)
+        indices = rng.permutation(len(infos))
+        split_idx = int(np.floor(self.random_ratio * len(infos)))
+        selected = indices[:split_idx] if split == 'train' else indices[split_idx:]
+        selected = np.sort(selected)
+        return [infos[int(i)] for i in selected]
 
     def prepare_sample(self, index):
         info = self.data_infos[index]
