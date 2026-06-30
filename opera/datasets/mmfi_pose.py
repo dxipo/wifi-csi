@@ -148,6 +148,7 @@ class MMFiPoseDataset(dataset):
                  sdp_offline_dir=None,
                  sdp_offline_ext='.npy',
                  strict_sdp_offline=True,
+                 query_selection='oracle',
                  max_samples=None,
                  subjects=None,
                  actions=None,
@@ -190,6 +191,11 @@ class MMFiPoseDataset(dataset):
         self.sdp_offline_dir = sdp_offline_dir
         self.sdp_offline_ext = sdp_offline_ext
         self.strict_sdp_offline = strict_sdp_offline
+        if query_selection not in ('oracle', 'top_score', 'first'):
+            raise ValueError(
+                'query_selection must be one of "oracle", "top_score", '
+                f'or "first", got {query_selection}')
+        self.query_selection = query_selection
         self.max_samples = max_samples
         self.subject_action_map = build_subject_action_map(
             protocol=protocol,
@@ -750,11 +756,22 @@ class MMFiPoseDataset(dataset):
     def select_prediction(self, result, gt):
         if not isinstance(result, (list, tuple)) or len(result) < 2:
             return None
+        det_bboxes = result[0][0]
         pred_keypoints = result[1][0]
         if pred_keypoints is None or len(pred_keypoints) == 0:
             return None
-        distances = np.linalg.norm(pred_keypoints - gt[None, ...], axis=-1).mean(axis=-1)
-        return pred_keypoints[int(np.argmin(distances))].astype(np.float32)
+        if self.query_selection == 'oracle':
+            distances = np.linalg.norm(pred_keypoints - gt[None, ...], axis=-1).mean(axis=-1)
+            index = int(np.argmin(distances))
+        elif self.query_selection == 'top_score':
+            if (det_bboxes is not None and len(det_bboxes) == len(pred_keypoints)
+                    and det_bboxes.shape[-1] >= 5):
+                index = int(np.argmax(det_bboxes[:, 4]))
+            else:
+                index = 0
+        else:
+            index = 0
+        return pred_keypoints[index].astype(np.float32)
 
     @staticmethod
     def pelvis(keypoints):
