@@ -97,6 +97,9 @@ class PETRHead(AnchorFreeHead):
                  axis_loss_weights=(1.0, 1.0, 1.0),
                  pelvis_indices=(11, 12),
                  skeleton_edges=None,
+                 query_quality_loss_weight=0.0,
+                 query_quality_tau=0.15,
+                 query_quality_loss_type='bce',
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
                  **kwargs):
@@ -148,6 +151,13 @@ class PETRHead(AnchorFreeHead):
         self.skeleton_edges = tuple(
             (int(src), int(dst)) for src, dst in skeleton_edges
             if src < num_keypoints and dst < num_keypoints)
+        self.query_quality_loss_weight = query_quality_loss_weight
+        self.query_quality_tau = query_quality_tau
+        if query_quality_loss_type not in ('bce', 'mse'):
+            raise ValueError(
+                'query_quality_loss_type must be "bce" or "mse", '
+                f'got {query_quality_loss_type}')
+        self.query_quality_loss_type = query_quality_loss_type
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
         else:
@@ -716,6 +726,11 @@ class PETRHead(AnchorFreeHead):
         # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
         loss_dict['loss_kpt'] = losses_kpt[-1]
+        if self.query_quality_loss_weight > 0:
+            loss_dict.update(
+                self.loss_query_quality(
+                    all_cls_scores[-1], all_kpt_preds[-1],
+                    gt_keypoints_list))
         # loss from other decoder layers
         num_dec_layer = 0
         for loss_cls_i, loss_kpt_i in zip(
@@ -726,6 +741,56 @@ class PETRHead(AnchorFreeHead):
 
         return loss_dict, (kpt_preds_list[-1], kpt_targets_list[-1],
                         kpt_weights_list[-1])
+
+    def loss_query_quality(self, cls_scores, kpt_preds, gt_keypoints_list):
+        """Train query confidence to reflect GT pose quality.
+
+        The quality target is detached so this auxiliary loss calibrates scores
+        without using the score branch to optimize coordinates.
+        """
+        if self.loss_cls.use_sigmoid:
+            score_logits = cls_scores[..., 0]
+        else:
+            score_logits = cls_scores[..., :-1].max(-1)[0]
+
+        quality_targets = []
+        quality_best_err = []
+        with torch.no_grad():
+            pred = kpt_preds.reshape(kpt_preds.size(0), kpt_preds.size(1),
+                                     self.num_keypoints, 3).detach()
+            for img_id, gt_keypoints in enumerate(gt_keypoints_list):
+                gt = gt_keypoints.to(pred.device).reshape(
+                    -1, self.num_keypoints, 3)
+                if gt.numel() == 0:
+                    quality = score_logits.new_zeros(score_logits.size(1))
+                    best_err = score_logits.new_tensor(0.0)
+                else:
+                    err = torch.norm(
+                        pred[img_id].unsqueeze(1) - gt.unsqueeze(0),
+                        p=2,
+                        dim=-1).mean(-1)
+                    min_err = err.min(dim=1)[0]
+                    quality = torch.exp(
+                        -min_err / max(float(self.query_quality_tau), 1e-6))
+                    quality = quality.clamp(min=0.0, max=1.0)
+                    best_err = min_err.min()
+                quality_targets.append(quality)
+                quality_best_err.append(best_err)
+            quality_targets = torch.stack(quality_targets, dim=0).detach()
+
+        if self.query_quality_loss_type == 'bce':
+            loss_quality = F.binary_cross_entropy_with_logits(
+                score_logits, quality_targets, reduction='mean')
+        else:
+            loss_quality = F.mse_loss(
+                score_logits.sigmoid(), quality_targets, reduction='mean')
+        loss_quality = loss_quality * self.query_quality_loss_weight
+
+        return dict(
+            loss_query_quality=loss_quality,
+            query_quality_target_mean=quality_targets.mean().detach(),
+            query_quality_score_mean=score_logits.sigmoid().mean().detach(),
+            query_quality_best_err=torch.stack(quality_best_err).mean().detach())
 
     def loss_heatmap(self, hm_pred, hm_mask, gt_keypoints, gt_labels,
                      gt_bboxes):
