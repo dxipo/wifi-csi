@@ -135,6 +135,7 @@ class MMFiPoseDataset(dataset):
                  sdp_acf_unbiased=False,
                  sdp_positive_clip=True,
                  sdp_zero_column_fill='uniform',
+                 sdp_center_aligned=False,
                  return_pose2d=False,
                  pose2d_window=9,
                  pose2d_normalize=True,
@@ -176,7 +177,8 @@ class MMFiPoseDataset(dataset):
             ma_window=sdp_ma_window,
             acf_unbiased=sdp_acf_unbiased,
             positive_clip=sdp_positive_clip,
-            zero_column_fill=sdp_zero_column_fill)
+            zero_column_fill=sdp_zero_column_fill,
+            center_aligned=sdp_center_aligned)
         self.return_pose2d = return_pose2d
         self.pose2d_window = pose2d_window
         self.pose2d_normalize = pose2d_normalize
@@ -265,6 +267,8 @@ class MMFiPoseDataset(dataset):
             csi = self.load_sdp_imagelike(info)
         elif self.preprocess == 'sdp_imagelike_offline':
             csi = self.load_sdp_imagelike_offline(info)
+        elif self.preprocess == 'sdp_power_acf_phase_time_token':
+            csi = self.load_sdp_power_acf_phase_time_token(info)
         else:
             csi = self.load_csi(info['csi_path'])
         keypoint = np.load(info['gt_path'])[info['frame_idx']].astype(np.float32)
@@ -295,9 +299,10 @@ class MMFiPoseDataset(dataset):
             csi = self.load_origin_style_csi(mat)
             return torch.from_numpy(csi).float()
         if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike',
-                               'sdp_imagelike_offline'):
+                               'sdp_imagelike_offline',
+                               'sdp_power_acf_phase_time_token'):
             raise ValueError(
-                'SDP image preprocessing requires load_sdp_imagelike(info), '
+                'SDP preprocessing requires the full sample info, '
                 'not load_csi(csi_path).')
         if self.preprocess != 'raw':
             raise ValueError(f'Unsupported MMFi CSI preprocess: {self.preprocess}')
@@ -334,6 +339,29 @@ class MMFiPoseDataset(dataset):
             sdp = data
         return torch.from_numpy(
             np.ascontiguousarray(sdp.astype(np.float32))).float()
+
+    def load_sdp_power_acf_phase_time_token(self, info):
+        mat = scio.loadmat(info['csi_path'])
+        amp = self.replace_invalid(mat['CSIamp'].astype(np.float32))
+        center_time = amp.shape[-1]
+
+        amp_context = self.load_centered_amp_window(info)
+        sdp_tokens = self.extract_centered_power_acf_tokens_from_amp(
+            amp_context, center_time=center_time)
+
+        features = [sdp_tokens]
+        if self.use_phase:
+            phase = self.replace_invalid(mat['CSIphase'].astype(np.float32))
+            complex_csi = amp.astype(np.float64) * np.exp(
+                1j * phase.astype(np.float64))
+            csi_phase = np.angle(self.phase_deno(complex_csi)).astype(np.float32)
+            phase_tokens = np.transpose(csi_phase, (0, 2, 1))
+            features.append(phase_tokens)
+
+        csi = np.concatenate(features, axis=-1).astype(np.float32)
+        if self.normalize_csi:
+            csi = self.normalize_feature(csi)
+        return torch.from_numpy(np.ascontiguousarray(csi)).float()
 
     def load_centered_amp_window(self, info):
         radius = int(self.sdp_cfg['context_radius'])
@@ -397,6 +425,48 @@ class MMFiPoseDataset(dataset):
                 raise ValueError(f"Unsupported sdp_layout={self.sdp_cfg['layout']}")
 
         return out.astype(np.float32)
+
+    def extract_centered_power_acf_tokens_from_amp(self, amp, center_time):
+        if amp.ndim != 3:
+            raise ValueError(
+                f'MMFi centered SDP expects amplitude shape (C,Subcarrier,T), got {amp.shape}')
+        channels, subcarriers, time_len = amp.shape
+        window_size = int(self.sdp_cfg['window_size'])
+        n_delta = int(self.sdp_cfg['n_delta'])
+        if n_delta >= window_size:
+            raise ValueError(
+                f'sdp_n_delta={n_delta} must be < sdp_window_size={window_size}')
+        if window_size > time_len:
+            raise ValueError(
+                f'sdp_window_size={window_size} > time length={time_len}')
+        if center_time <= 0 or center_time > time_len:
+            raise ValueError(
+                f'Invalid center_time={center_time} for time length={time_len}')
+
+        center_start = (time_len - center_time) // 2
+        half_window = window_size // 2
+        acf = np.zeros((channels, subcarriers, center_time, n_delta),
+                       dtype=np.float32)
+
+        for channel in range(channels):
+            for sc in range(subcarriers):
+                series = amp[channel, sc].astype(np.float32)
+                series = self.preprocess_sdp_series(series)
+                for token_idx in range(center_time):
+                    center = center_start + token_idx
+                    start = int(center - half_window)
+                    start = max(0, min(start, time_len - window_size))
+                    acf[channel, sc, token_idx] = self.compute_acf_for_series(
+                        series[start:start + window_size],
+                        n_delta=n_delta,
+                        unbiased=self.sdp_cfg['acf_unbiased'])
+
+        acf = self.normalize_sdp_lag_columns(
+            acf,
+            positive_clip=self.sdp_cfg['positive_clip'],
+            zero_column_fill=self.sdp_cfg['zero_column_fill'])
+        return np.transpose(acf, (0, 2, 1, 3)).reshape(
+            channels, center_time, subcarriers * n_delta).astype(np.float32)
 
     def preprocess_sdp_series(self, x):
         y = np.asarray(x, dtype=np.float32)
