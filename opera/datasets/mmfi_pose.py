@@ -148,6 +148,7 @@ class MMFiPoseDataset(dataset):
                  sdp_offline_dir=None,
                  sdp_offline_ext='.npy',
                  strict_sdp_offline=True,
+                 query_selection='oracle',
                  max_samples=None,
                  subjects=None,
                  actions=None,
@@ -190,6 +191,7 @@ class MMFiPoseDataset(dataset):
         self.sdp_offline_dir = sdp_offline_dir
         self.sdp_offline_ext = sdp_offline_ext
         self.strict_sdp_offline = strict_sdp_offline
+        self.query_selection = query_selection
         self.max_samples = max_samples
         self.subject_action_map = build_subject_action_map(
             protocol=protocol,
@@ -750,11 +752,26 @@ class MMFiPoseDataset(dataset):
     def select_prediction(self, result, gt):
         if not isinstance(result, (list, tuple)) or len(result) < 2:
             return None
+        pred_bboxes = result[0][0]
         pred_keypoints = result[1][0]
         if pred_keypoints is None or len(pred_keypoints) == 0:
             return None
-        distances = np.linalg.norm(pred_keypoints - gt[None, ...], axis=-1).mean(axis=-1)
-        return pred_keypoints[int(np.argmin(distances))].astype(np.float32)
+
+        if self.query_selection == 'oracle':
+            distances = np.linalg.norm(
+                pred_keypoints - gt[None, ...], axis=-1).mean(axis=-1)
+            return pred_keypoints[int(np.argmin(distances))].astype(np.float32)
+
+        if self.query_selection == 'top_score':
+            if pred_bboxes is not None and len(pred_bboxes) == len(pred_keypoints):
+                return pred_keypoints[int(np.argmax(pred_bboxes[:, -1]))].astype(
+                    np.float32)
+            return pred_keypoints[0].astype(np.float32)
+
+        if self.query_selection == 'first':
+            return pred_keypoints[0].astype(np.float32)
+
+        raise ValueError(f'Unsupported query_selection: {self.query_selection}')
 
     @staticmethod
     def pelvis(keypoints):
