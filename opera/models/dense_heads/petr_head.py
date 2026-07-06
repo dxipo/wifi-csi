@@ -100,6 +100,7 @@ class PETRHead(AnchorFreeHead):
                  query_quality_loss_weight=0.0,
                  query_quality_loss_mode='quality',
                  query_quality_tau=0.15,
+                 query_quality_score_tau=1.0,
                  query_quality_loss_type='bce',
                  query_quality_rank_delta=0.005,
                  query_quality_rank_margin=0.0,
@@ -155,16 +156,19 @@ class PETRHead(AnchorFreeHead):
             (int(src), int(dst)) for src, dst in skeleton_edges
             if src < num_keypoints and dst < num_keypoints)
         self.query_quality_loss_weight = query_quality_loss_weight
-        if query_quality_loss_mode not in ('quality', 'pairwise'):
+        if query_quality_loss_mode not in ('quality', 'pairwise', 'listwise'):
             raise ValueError(
-                'query_quality_loss_mode must be "quality" or "pairwise", '
+                'query_quality_loss_mode must be "quality", "pairwise", '
+                'or "listwise", '
                 f'got {query_quality_loss_mode}')
         self.query_quality_loss_mode = query_quality_loss_mode
         self.query_quality_tau = query_quality_tau
-        if query_quality_loss_type not in ('bce', 'mse', 'softplus', 'hinge'):
+        self.query_quality_score_tau = float(query_quality_score_tau)
+        if query_quality_loss_type not in (
+                'bce', 'mse', 'softplus', 'hinge', 'kl'):
             raise ValueError(
                 'query_quality_loss_type must be one of '
-                '"bce", "mse", "softplus", or "hinge", '
+                '"bce", "mse", "softplus", "hinge", or "kl", '
                 f'got {query_quality_loss_type}')
         self.query_quality_loss_type = query_quality_loss_type
         self.query_quality_rank_delta = float(query_quality_rank_delta)
@@ -766,6 +770,9 @@ class PETRHead(AnchorFreeHead):
         if self.query_quality_loss_mode == 'pairwise':
             return self.loss_query_pairwise_rank(
                 score_logits, min_errs, best_errs, valid_mask)
+        if self.query_quality_loss_mode == 'listwise':
+            return self.loss_query_listwise_rank(
+                score_logits, min_errs, best_errs, valid_mask)
 
         if self.query_quality_loss_type not in ('bce', 'mse'):
             raise ValueError(
@@ -884,6 +891,55 @@ class PETRHead(AnchorFreeHead):
             query_rank_best_err=valid_best_errs.mean().detach(),
             query_rank_oracle_gap=(
                 valid_top1_err.mean() - valid_best_errs.mean()).detach())
+
+    def loss_query_listwise_rank(self, score_logits, min_errs, best_errs,
+                                 valid_mask):
+        if self.query_quality_loss_type != 'kl':
+            raise ValueError(
+                'listwise mode requires query_quality_loss_type "kl", '
+                f'got {self.query_quality_loss_type}')
+
+        valid_scores = score_logits[valid_mask]
+        valid_errs = min_errs[valid_mask]
+        valid_best_errs = best_errs[valid_mask]
+        if valid_scores.numel() == 0:
+            zero = score_logits.sum() * 0.0
+            return dict(
+                loss_query_listwise_rank=zero,
+                query_list_target_entropy=zero.detach(),
+                query_list_score_entropy=zero.detach(),
+                query_list_top1_err=zero.detach(),
+                query_list_best_err=zero.detach(),
+                query_list_oracle_gap=zero.detach())
+
+        err_tau = max(float(self.query_quality_tau), 1e-6)
+        score_tau = max(float(self.query_quality_score_tau), 1e-6)
+        with torch.no_grad():
+            target_dist = F.softmax(-valid_errs / err_tau, dim=1).detach()
+        log_score_dist = F.log_softmax(valid_scores / score_tau, dim=1)
+        loss_listwise = F.kl_div(
+            log_score_dist, target_dist, reduction='batchmean')
+        loss_listwise = loss_listwise * self.query_quality_loss_weight
+
+        score_dist = log_score_dist.exp()
+        target_entropy = -(target_dist *
+                           (target_dist.clamp_min(1e-8).log())).sum(dim=1)
+        score_entropy = -(score_dist *
+                          (score_dist.clamp_min(1e-8).log())).sum(dim=1)
+
+        top1_index = valid_scores.argmax(dim=1)
+        batch_indices = torch.arange(valid_scores.size(0),
+                                     device=valid_scores.device)
+        top1_err = valid_errs[batch_indices, top1_index]
+
+        return dict(
+            loss_query_listwise_rank=loss_listwise,
+            query_list_target_entropy=target_entropy.mean().detach(),
+            query_list_score_entropy=score_entropy.mean().detach(),
+            query_list_top1_err=top1_err.mean().detach(),
+            query_list_best_err=valid_best_errs.mean().detach(),
+            query_list_oracle_gap=(
+                top1_err.mean() - valid_best_errs.mean()).detach())
 
     def loss_heatmap(self, hm_pred, hm_mask, gt_keypoints, gt_labels,
                      gt_bboxes):
