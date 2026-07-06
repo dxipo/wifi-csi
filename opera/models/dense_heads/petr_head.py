@@ -98,8 +98,11 @@ class PETRHead(AnchorFreeHead):
                  pelvis_indices=(11, 12),
                  skeleton_edges=None,
                  query_quality_loss_weight=0.0,
+                 query_quality_loss_mode='quality',
                  query_quality_tau=0.15,
                  query_quality_loss_type='bce',
+                 query_quality_rank_delta=0.005,
+                 query_quality_rank_margin=0.0,
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
                  **kwargs):
@@ -152,12 +155,20 @@ class PETRHead(AnchorFreeHead):
             (int(src), int(dst)) for src, dst in skeleton_edges
             if src < num_keypoints and dst < num_keypoints)
         self.query_quality_loss_weight = query_quality_loss_weight
-        self.query_quality_tau = query_quality_tau
-        if query_quality_loss_type not in ('bce', 'mse'):
+        if query_quality_loss_mode not in ('quality', 'pairwise'):
             raise ValueError(
-                'query_quality_loss_type must be "bce" or "mse", '
+                'query_quality_loss_mode must be "quality" or "pairwise", '
+                f'got {query_quality_loss_mode}')
+        self.query_quality_loss_mode = query_quality_loss_mode
+        self.query_quality_tau = query_quality_tau
+        if query_quality_loss_type not in ('bce', 'mse', 'softplus', 'hinge'):
+            raise ValueError(
+                'query_quality_loss_type must be one of '
+                '"bce", "mse", "softplus", or "hinge", '
                 f'got {query_quality_loss_type}')
         self.query_quality_loss_type = query_quality_loss_type
+        self.query_quality_rank_delta = float(query_quality_rank_delta)
+        self.query_quality_rank_margin = float(query_quality_rank_margin)
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
         else:
@@ -748,35 +759,23 @@ class PETRHead(AnchorFreeHead):
         The quality target is detached so this auxiliary loss calibrates scores
         without using the score branch to optimize coordinates.
         """
-        if self.loss_cls.use_sigmoid:
-            score_logits = cls_scores[..., 0]
-        else:
-            score_logits = cls_scores[..., :-1].max(-1)[0]
+        score_logits = self.get_query_score_logits(cls_scores)
+        min_errs, best_errs, valid_mask = self.get_query_pose_errors(
+            kpt_preds, gt_keypoints_list)
 
-        quality_targets = []
-        quality_best_err = []
+        if self.query_quality_loss_mode == 'pairwise':
+            return self.loss_query_pairwise_rank(
+                score_logits, min_errs, best_errs, valid_mask)
+
+        if self.query_quality_loss_type not in ('bce', 'mse'):
+            raise ValueError(
+                'quality mode requires query_quality_loss_type "bce" or '
+                f'"mse", got {self.query_quality_loss_type}')
+
         with torch.no_grad():
-            pred = kpt_preds.reshape(kpt_preds.size(0), kpt_preds.size(1),
-                                     self.num_keypoints, 3).detach()
-            for img_id, gt_keypoints in enumerate(gt_keypoints_list):
-                gt = gt_keypoints.to(pred.device).reshape(
-                    -1, self.num_keypoints, 3)
-                if gt.numel() == 0:
-                    quality = score_logits.new_zeros(score_logits.size(1))
-                    best_err = score_logits.new_tensor(0.0)
-                else:
-                    err = torch.norm(
-                        pred[img_id].unsqueeze(1) - gt.unsqueeze(0),
-                        p=2,
-                        dim=-1).mean(-1)
-                    min_err = err.min(dim=1)[0]
-                    quality = torch.exp(
-                        -min_err / max(float(self.query_quality_tau), 1e-6))
-                    quality = quality.clamp(min=0.0, max=1.0)
-                    best_err = min_err.min()
-                quality_targets.append(quality)
-                quality_best_err.append(best_err)
-            quality_targets = torch.stack(quality_targets, dim=0).detach()
+            quality_targets = torch.exp(
+                -min_errs / max(float(self.query_quality_tau), 1e-6))
+            quality_targets = quality_targets.clamp(min=0.0, max=1.0).detach()
 
         if self.query_quality_loss_type == 'bce':
             loss_quality = F.binary_cross_entropy_with_logits(
@@ -790,7 +789,101 @@ class PETRHead(AnchorFreeHead):
             loss_query_quality=loss_quality,
             query_quality_target_mean=quality_targets.mean().detach(),
             query_quality_score_mean=score_logits.sigmoid().mean().detach(),
-            query_quality_best_err=torch.stack(quality_best_err).mean().detach())
+            query_quality_best_err=best_errs[valid_mask].mean().detach())
+
+    def get_query_score_logits(self, cls_scores):
+        if self.loss_cls.use_sigmoid:
+            return cls_scores[..., 0]
+        return cls_scores[..., :-1].max(-1)[0]
+
+    def get_query_pose_errors(self, kpt_preds, gt_keypoints_list):
+        min_errs = []
+        best_errs = []
+        valid = []
+        with torch.no_grad():
+            pred = kpt_preds.reshape(kpt_preds.size(0), kpt_preds.size(1),
+                                     self.num_keypoints, 3).detach()
+            for img_id, gt_keypoints in enumerate(gt_keypoints_list):
+                gt = gt_keypoints.to(pred.device).reshape(
+                    -1, self.num_keypoints, 3)
+                if gt.numel() == 0:
+                    min_err = pred.new_zeros(pred.size(1))
+                    best_err = pred.new_tensor(0.0)
+                    is_valid = False
+                else:
+                    err = torch.norm(
+                        pred[img_id].unsqueeze(1) - gt.unsqueeze(0),
+                        p=2,
+                        dim=-1).mean(-1)
+                    min_err = err.min(dim=1)[0]
+                    best_err = min_err.min()
+                    is_valid = True
+                min_errs.append(min_err)
+                best_errs.append(best_err)
+                valid.append(is_valid)
+        valid_mask = torch.tensor(
+            valid, dtype=torch.bool, device=kpt_preds.device)
+        return (torch.stack(min_errs, dim=0).detach(),
+                torch.stack(best_errs, dim=0).detach(), valid_mask)
+
+    def loss_query_pairwise_rank(self, score_logits, min_errs, best_errs,
+                                 valid_mask):
+        if self.query_quality_loss_type not in ('softplus', 'hinge'):
+            raise ValueError(
+                'pairwise mode requires query_quality_loss_type "softplus" '
+                f'or "hinge", got {self.query_quality_loss_type}')
+
+        pair_losses = []
+        pair_score_gaps = []
+        delta = float(self.query_quality_rank_delta)
+        margin = float(self.query_quality_rank_margin)
+        for img_id in range(score_logits.size(0)):
+            if not bool(valid_mask[img_id]):
+                continue
+            err = min_errs[img_id]
+            scores = score_logits[img_id]
+            better = err[:, None] + delta < err[None, :]
+            if not bool(better.any()):
+                continue
+            score_gap = scores[:, None] - scores[None, :]
+            selected_gap = score_gap[better]
+            if self.query_quality_loss_type == 'softplus':
+                pair_loss = F.softplus(-selected_gap)
+            else:
+                pair_loss = F.relu(margin - selected_gap)
+            pair_losses.append(pair_loss)
+            pair_score_gaps.append(selected_gap.detach())
+
+        if len(pair_losses) == 0:
+            loss_rank = score_logits.sum() * 0.0
+            pair_count = score_logits.new_tensor(0.0)
+            score_gap_mean = score_logits.new_tensor(0.0)
+        else:
+            pair_losses = torch.cat(pair_losses)
+            pair_score_gaps = torch.cat(pair_score_gaps)
+            loss_rank = pair_losses.mean()
+            pair_count = score_logits.new_tensor(float(pair_losses.numel()))
+            score_gap_mean = pair_score_gaps.mean()
+        loss_rank = loss_rank * self.query_quality_loss_weight
+
+        top1_index = score_logits.argmax(dim=1)
+        batch_indices = torch.arange(score_logits.size(0),
+                                     device=score_logits.device)
+        top1_err = min_errs[batch_indices, top1_index]
+        valid_best_errs = best_errs[valid_mask]
+        valid_top1_err = top1_err[valid_mask]
+        if valid_top1_err.numel() == 0:
+            valid_top1_err = score_logits.new_zeros(1)
+            valid_best_errs = score_logits.new_zeros(1)
+
+        return dict(
+            loss_query_pairwise_rank=loss_rank,
+            query_rank_pair_count=pair_count.detach(),
+            query_rank_score_gap=score_gap_mean.detach(),
+            query_rank_top1_err=valid_top1_err.mean().detach(),
+            query_rank_best_err=valid_best_errs.mean().detach(),
+            query_rank_oracle_gap=(
+                valid_top1_err.mean() - valid_best_errs.mean()).detach())
 
     def loss_heatmap(self, hm_pred, hm_mask, gt_keypoints, gt_labels,
                      gt_bboxes):
