@@ -13,11 +13,14 @@ import h5py
 @DATASETS.register_module()
 class WifiPoseDataset(dataset):
     CLASSES = ('person', )
-    def __init__(self, dataset_root, pipeline, mode, **kwargs):
+    def __init__(self, dataset_root, pipeline, mode, query_selection='oracle',
+                 query_topk='num_gt', **kwargs):
         
         self.data_root = dataset_root
         self.pipeline = Compose(pipeline)
         self.filename_list = self.load_file_name_list(os.path.join(self.data_root, mode + '_data_list.txt'))
+        self.query_selection = query_selection
+        self.query_topk = query_topk
         self._set_group_flag()
         
     def pre_pipeline(self, results):
@@ -33,7 +36,8 @@ class WifiPoseDataset(dataset):
         csi = np.array(csi)
         csi = csi.astype(np.complex128)'''
         
-        csi = h5py.File(csi_path)['csi_out'].value
+        with h5py.File(csi_path) as csi_file:
+            csi = csi_file['csi_out'][()]
         csi = csi['real'] + csi['imag']*1j
         csi = np.array(csi).transpose(3,2,1,0)
         csi = csi.astype(np.complex128)
@@ -225,6 +229,12 @@ class WifiPoseDataset(dataset):
             det_bboxes, det_keypoints = results[i]
             for label in range(len(det_keypoints)):
                 kpt_pred = det_keypoints[label]
+                if self.query_selection == 'top_score':
+                    kpt_pred = self.select_top_score_keypoints(
+                        det_bboxes[label], kpt_pred, gt_keypoints.shape[0])
+                elif self.query_selection != 'oracle':
+                    raise ValueError(
+                        f'Unsupported query_selection: {self.query_selection}')
                 kpt_pred = torch.tensor(kpt_pred, dtype=gt_keypoints.dtype, device=gt_keypoints.device)
                 #np.save('/home/yankangwei/opera-main/result/pose_o/%s.npy' %data_name, kpt_pred)
                 mpjpe_3d,mpjpeh,mpjpev,mpjped = self.calc_mpjpe(gt_keypoints, kpt_pred, data_name, root = [5,7])
@@ -240,6 +250,23 @@ class WifiPoseDataset(dataset):
         mpjped = np.array(mpjpe_d_list).mean() 
         result = {'mpjpe':mpjpe, 'mpjpeh':mpjpeh, 'mpjpev':mpjpev, 'mpjped':mpjped}
         return OrderedDict(result)
+
+    def select_top_score_keypoints(self, det_bboxes, det_keypoints, num_gt):
+        if det_keypoints.shape[0] == 0:
+            return det_keypoints
+
+        if self.query_topk == 'num_gt':
+            topk = int(num_gt)
+        else:
+            topk = int(self.query_topk)
+        topk = max(1, min(topk, det_keypoints.shape[0]))
+
+        if det_bboxes is None or det_bboxes.shape[0] == 0:
+            return det_keypoints[:topk]
+
+        scores = det_bboxes[:, 4]
+        order = np.argsort(-scores)[:topk]
+        return det_keypoints[order]
     
     def calc_mpjpe(self, real, pred, no, root=0):
         n = real.shape[0]
