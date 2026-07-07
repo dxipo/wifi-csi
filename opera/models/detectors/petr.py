@@ -34,11 +34,23 @@ class PETR(DETR):
                  patch_stride=None,
                  patch_padding=0,
                  patch_out_dim=256,
+                 raw_input_dim=228,
+                 sdp_input_dim=684,
+                 sdp_aux_init=0.05,
                  **kwargs):
         super(DETR, self).__init__(*args, **kwargs)
         self.input_stem = input_stem
         if input_stem == 'linear':
             self.head = Linear(input_dim, stem_out_channels)
+        elif input_stem == 'sdp_aux_residual':
+            self.raw_input_dim = int(raw_input_dim)
+            self.sdp_input_dim = int(sdp_input_dim)
+            self.head = Linear(self.raw_input_dim, stem_out_channels)
+            self.sdp_head = nn.Sequential(
+                nn.LayerNorm(self.sdp_input_dim),
+                Linear(self.sdp_input_dim, stem_out_channels))
+            self.sdp_aux_alpha = nn.Parameter(
+                torch.tensor(float(sdp_aux_init), dtype=torch.float32))
         elif input_stem == 'conv_patch':
             if patch_stride is None:
                 patch_stride = patch_kernel_size
@@ -103,6 +115,17 @@ class PETR(DETR):
             channel = img.shape[-1]
             x = img.reshape(bs, -1, channel)
             return self.head(x)
+        if self.input_stem == 'sdp_aux_residual':
+            bs = img.size(0)
+            channel = img.shape[-1]
+            expected_dim = self.raw_input_dim + self.sdp_input_dim
+            if channel != expected_dim:
+                raise ValueError(
+                    f'sdp_aux_residual expects CSI token dim {expected_dim}, got {channel}')
+            x = img.reshape(bs, -1, channel)
+            raw = x[..., :self.raw_input_dim]
+            sdp = x[..., self.raw_input_dim:]
+            return self.head(raw) + self.sdp_aux_alpha * self.sdp_head(sdp)
         if self.input_stem in ('conv2d', 'conv2d_3layer', 'conv_patch'):
             if img.dim() != 4:
                 raise ValueError(

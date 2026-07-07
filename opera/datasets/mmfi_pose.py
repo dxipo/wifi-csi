@@ -269,6 +269,8 @@ class MMFiPoseDataset(dataset):
             csi = self.load_sdp_imagelike_offline(info)
         elif self.preprocess == 'sdp_power_acf_phase_time_token':
             csi = self.load_sdp_power_acf_phase_time_token(info)
+        elif self.preprocess == 'sdp_power_acf_aux_time_token':
+            csi = self.load_sdp_power_acf_aux_time_token(info)
         else:
             csi = self.load_csi(info['csi_path'])
         keypoint = np.load(info['gt_path'])[info['frame_idx']].astype(np.float32)
@@ -300,7 +302,8 @@ class MMFiPoseDataset(dataset):
             return torch.from_numpy(csi).float()
         if self.preprocess in ('sdp_imagelike', 'sdp140_imagelike',
                                'sdp_imagelike_offline',
-                               'sdp_power_acf_phase_time_token'):
+                               'sdp_power_acf_phase_time_token',
+                               'sdp_power_acf_aux_time_token'):
             raise ValueError(
                 'SDP preprocessing requires the full sample info, '
                 'not load_csi(csi_path).')
@@ -357,6 +360,33 @@ class MMFiPoseDataset(dataset):
             csi_phase = np.angle(self.phase_deno(complex_csi)).astype(np.float32)
             phase_tokens = np.transpose(csi_phase, (0, 2, 1))
             features.append(phase_tokens)
+
+        csi = np.concatenate(features, axis=-1).astype(np.float32)
+        if self.normalize_csi:
+            csi = self.normalize_feature(csi)
+        return torch.from_numpy(np.ascontiguousarray(csi)).float()
+
+    def load_sdp_power_acf_aux_time_token(self, info):
+        mat = scio.loadmat(info['csi_path'])
+        amp = self.replace_invalid(mat['CSIamp'].astype(np.float32))
+        phase = self.replace_invalid(mat['CSIphase'].astype(np.float32))
+        center_time = amp.shape[-1]
+
+        complex_csi = amp.astype(np.float64) * np.exp(
+            1j * phase.astype(np.float64))
+        csi_amp = self.dwt_amp(complex_csi).astype(np.float32)
+        amp_tokens = np.transpose(csi_amp, (0, 2, 1))
+
+        features = [amp_tokens]
+        if self.use_phase:
+            csi_phase = np.angle(self.phase_deno(complex_csi)).astype(np.float32)
+            phase_tokens = np.transpose(csi_phase, (0, 2, 1))
+            features.append(phase_tokens)
+
+        amp_context = self.load_centered_amp_window(info)
+        sdp_tokens = self.extract_centered_power_acf_tokens_from_amp(
+            amp_context, center_time=center_time)
+        features.append(sdp_tokens)
 
         csi = np.concatenate(features, axis=-1).astype(np.float32)
         if self.normalize_csi:
