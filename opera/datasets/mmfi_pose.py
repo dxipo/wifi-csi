@@ -447,19 +447,21 @@ class MMFiPoseDataset(dataset):
         half_window = window_size // 2
         acf = np.zeros((channels, subcarriers, center_time, n_delta),
                        dtype=np.float32)
+        power = self.preprocess_sdp_amp_tensor(amp)
 
-        for channel in range(channels):
-            for sc in range(subcarriers):
-                series = amp[channel, sc].astype(np.float32)
-                series = self.preprocess_sdp_series(series)
-                for token_idx in range(center_time):
-                    center = center_start + token_idx
-                    start = int(center - half_window)
-                    start = max(0, min(start, time_len - window_size))
-                    acf[channel, sc, token_idx] = self.compute_acf_for_series(
-                        series[start:start + window_size],
-                        n_delta=n_delta,
-                        unbiased=self.sdp_cfg['acf_unbiased'])
+        for token_idx in range(center_time):
+            center = center_start + token_idx
+            start = int(center - half_window)
+            start = max(0, min(start, time_len - window_size))
+            window = power[:, :, start:start + window_size]
+            x = window - window.mean(axis=-1, keepdims=True)
+            var = np.var(x, axis=-1)
+            valid = var >= 1e-8
+            for lag in range(1, n_delta + 1):
+                denom = (window_size - lag) if self.sdp_cfg['acf_unbiased'] else window_size
+                val = np.sum(x[:, :, lag:] * x[:, :, :-lag], axis=-1) / float(denom)
+                acf[:, :, token_idx, lag - 1] = np.where(
+                    valid, val / np.maximum(var, 1e-8), 0.0)
 
         acf = self.normalize_sdp_lag_columns(
             acf,
@@ -467,6 +469,23 @@ class MMFiPoseDataset(dataset):
             zero_column_fill=self.sdp_cfg['zero_column_fill'])
         return np.transpose(acf, (0, 2, 1, 3)).reshape(
             channels, center_time, subcarriers * n_delta).astype(np.float32)
+
+    def preprocess_sdp_amp_tensor(self, amp):
+        y = np.asarray(amp, dtype=np.float32).copy()
+        channels, subcarriers, _ = y.shape
+        if self.sdp_cfg['use_hampel']:
+            for channel in range(channels):
+                for sc in range(subcarriers):
+                    y[channel, sc] = self.hampel_filter_1d(
+                        y[channel, sc],
+                        window=int(self.sdp_cfg['hampel_window']),
+                        sigma=float(self.sdp_cfg['hampel_sigma']))
+        if self.sdp_cfg['use_moving_average']:
+            for channel in range(channels):
+                for sc in range(subcarriers):
+                    y[channel, sc] = self.moving_average_1d(
+                        y[channel, sc], window=int(self.sdp_cfg['ma_window']))
+        return np.square(y).astype(np.float32)
 
     def preprocess_sdp_series(self, x):
         y = np.asarray(x, dtype=np.float32)
