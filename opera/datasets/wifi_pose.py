@@ -33,7 +33,8 @@ class WifiPoseDataset(dataset):
         csi = np.array(csi)
         csi = csi.astype(np.complex128)'''
         
-        csi = h5py.File(csi_path)['csi_out'].value
+        with h5py.File(csi_path) as csi_file:
+            csi = csi_file['csi_out'][()]
         csi = csi['real'] + csi['imag']*1j
         csi = np.array(csi).transpose(3,2,1,0)
         csi = csi.astype(np.complex128)
@@ -218,6 +219,10 @@ class WifiPoseDataset(dataset):
         mpjpe_h_list = []
         mpjpe_v_list = []
         mpjpe_d_list = []
+        top_score_mpjpe_list = []
+        top_score_h_list = []
+        top_score_v_list = []
+        top_score_d_list = []
         for i in range(len(results)):
             info = self.get_item_single_frame(i)
             gt_keypoints = info['gt_keypoints']
@@ -232,14 +237,47 @@ class WifiPoseDataset(dataset):
                 mpjpe_h_list.append(mpjpeh.numpy())
                 mpjpe_v_list.append(mpjpev.numpy())
                 mpjpe_d_list.append(mpjped.numpy())
+                top_score_pred = self.select_top_score_keypoints(
+                    det_bboxes[label], det_keypoints[label],
+                    gt_keypoints.shape[0])
+                top_score_pred = torch.tensor(
+                    top_score_pred,
+                    dtype=gt_keypoints.dtype,
+                    device=gt_keypoints.device)
+                top_mpjpe, top_h, top_v, top_d = self.calc_mpjpe(
+                    gt_keypoints, top_score_pred, data_name, root=[5, 7])
+                top_score_mpjpe_list.append(top_mpjpe.numpy())
+                top_score_h_list.append(top_h.numpy())
+                top_score_v_list.append(top_v.numpy())
+                top_score_d_list.append(top_d.numpy())
                 #mpjpe_3d_list.append(np.array([0]))
 
         mpjpe = np.array(mpjpe_3d_list).mean()   
         mpjpeh = np.array(mpjpe_h_list).mean() 
         mpjpev = np.array(mpjpe_v_list).mean() 
         mpjped = np.array(mpjpe_d_list).mean() 
-        result = {'mpjpe':mpjpe, 'mpjpeh':mpjpeh, 'mpjpev':mpjpev, 'mpjped':mpjped}
+        result = {
+            'mpjpe': mpjpe,
+            'mpjpeh': mpjpeh,
+            'mpjpev': mpjpev,
+            'mpjped': mpjped,
+            'mpjpe_top_score': np.array(top_score_mpjpe_list).mean(),
+            'mpjpeh_top_score': np.array(top_score_h_list).mean(),
+            'mpjpev_top_score': np.array(top_score_v_list).mean(),
+            'mpjped_top_score': np.array(top_score_d_list).mean()
+        }
         return OrderedDict(result)
+
+    @staticmethod
+    def select_top_score_keypoints(det_bboxes, det_keypoints, num_gt):
+        """Select predictions by model confidence without GT coordinates."""
+        if det_keypoints.shape[0] == 0:
+            return det_keypoints
+        topk = max(1, min(int(num_gt), det_keypoints.shape[0]))
+        if det_bboxes is None or det_bboxes.shape[0] == 0:
+            return det_keypoints[:topk]
+        order = np.argsort(-det_bboxes[:, 4])[:topk]
+        return det_keypoints[order]
     
     def calc_mpjpe(self, real, pred, no, root=0):
         n = real.shape[0]

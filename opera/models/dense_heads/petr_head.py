@@ -86,6 +86,7 @@ class PETRHead(AnchorFreeHead):
                  loss_kpt_rpn=dict(type='mmdet.L2Loss', loss_weight=70.0),
                  loss_kpt_refine=dict(type='mmdet.L2Loss', loss_weight=70.0),
                  loss_oks_refine=dict(type='opera.OKSLoss', loss_weight=2.0),
+                 dn_cfg=None,
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
                  **kwargs):
@@ -119,6 +120,8 @@ class PETRHead(AnchorFreeHead):
         self.as_two_stage = as_two_stage
         self.with_kpt_refine = with_kpt_refine
         self.num_keypoints = num_keypoints
+        self.dn_cfg = dn_cfg
+        self.with_dn = dn_cfg is not None and dn_cfg.get('enabled', True)
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
         else:
@@ -182,6 +185,14 @@ class PETRHead(AnchorFreeHead):
         self.query_embedding = nn.Embedding(self.num_query,
                                             self.embed_dims * 2)
 
+        if self.with_dn:
+            pose_dims = self.num_keypoints * 3
+            self.dn_pose_encoder = nn.Sequential(
+                Linear(pose_dims, self.embed_dims),
+                nn.ReLU(inplace=True),
+                Linear(self.embed_dims, self.embed_dims))
+            self.dn_content_embedding = nn.Embedding(1, self.embed_dims)
+
         refine_kpt_branch = []
         for _ in range(self.num_kpt_fcs):
             refine_kpt_branch.append(Linear(self.embed_dims, self.embed_dims))
@@ -210,7 +221,86 @@ class PETRHead(AnchorFreeHead):
         bias_init = bias_init_with_prob(0.1)
         normal_init(self.fc_hm, std=0.01, bias=bias_init)
 
-    def forward(self, mlvl_feats, img_metas):
+    def _prepare_dn_queries(self, gt_keypoints_list):
+        """Build positive pose-denoising queries with known GT assignments."""
+        if not self.with_dn or not self.training or gt_keypoints_list is None:
+            return None
+
+        batch_size = len(gt_keypoints_list)
+        max_num_gt = max((gt.size(0) for gt in gt_keypoints_list), default=0)
+        if max_num_gt == 0:
+            return None
+
+        num_groups = self.dn_cfg.get('num_groups', 5)
+        root_indices = self.dn_cfg.get('root_indices', [5, 7])
+        root_noise_std = self.dn_cfg.get('root_noise_std', 0.03)
+        joint_noise_std = self.dn_cfg.get('joint_noise_std', 0.02)
+        scale_noise_std = self.dn_cfg.get('scale_noise_std', 0.03)
+        pad_size = max_num_gt * num_groups
+        pose_dims = self.num_keypoints * 3
+        device = gt_keypoints_list[0].device
+        dtype = gt_keypoints_list[0].dtype
+
+        references = torch.zeros(
+            batch_size, pad_size, pose_dims, device=device, dtype=dtype)
+        targets = torch.zeros_like(references)
+        valid_mask = torch.zeros(
+            batch_size, pad_size, device=device, dtype=torch.bool)
+
+        for batch_idx, gt_keypoints in enumerate(gt_keypoints_list):
+            num_gt = gt_keypoints.size(0)
+            if num_gt == 0:
+                continue
+            gt_pose = gt_keypoints.reshape(num_gt, self.num_keypoints, 3)
+            root = gt_pose[:, root_indices].mean(dim=1, keepdim=True)
+            relative_pose = gt_pose - root
+            for group_idx in range(num_groups):
+                root_noise = torch.randn_like(root) * root_noise_std
+                scale_noise = 1.0 + torch.randn(
+                    num_gt, 1, 1, device=device, dtype=dtype) * scale_noise_std
+                joint_noise = torch.randn_like(gt_pose) * joint_noise_std
+                noisy_pose = (root + root_noise +
+                              relative_pose * scale_noise + joint_noise)
+                start = group_idx * max_num_gt
+                end = start + num_gt
+                references[batch_idx, start:end] = noisy_pose.flatten(1)
+                targets[batch_idx, start:end] = gt_pose.flatten(1)
+                valid_mask[batch_idx, start:end] = True
+
+        query_pos = self.dn_pose_encoder(references)
+        query = self.dn_content_embedding.weight[0].view(1, 1, -1).expand(
+            batch_size, pad_size, -1)
+        query_pos = query_pos.masked_fill(~valid_mask.unsqueeze(-1), 0)
+        query = query.masked_fill(~valid_mask.unsqueeze(-1), 0)
+
+        total_queries = pad_size + self.num_query
+        attn_mask = torch.zeros(
+            total_queries, total_queries, device=device, dtype=torch.bool)
+        # Keep GT-derived DN queries isolated from normal matching queries.
+        attn_mask[:pad_size, pad_size:] = True
+        attn_mask[pad_size:, :pad_size] = True
+        for group_idx in range(num_groups):
+            start = group_idx * max_num_gt
+            end = start + max_num_gt
+            attn_mask[start:end, :start] = True
+            attn_mask[start:end, end:pad_size] = True
+
+        query_padding_mask = torch.cat([
+            ~valid_mask,
+            torch.zeros(
+                batch_size, self.num_query, device=device, dtype=torch.bool)
+        ], dim=1)
+        return dict(
+            query=query,
+            query_pos=query_pos,
+            reference_points=references,
+            targets=targets,
+            valid_mask=valid_mask,
+            attn_mask=attn_mask,
+            query_padding_mask=query_padding_mask,
+            pad_size=pad_size)
+
+    def forward(self, mlvl_feats, img_metas, gt_keypoints_list=None):
         """Forward function.
 
         Args:
@@ -254,6 +344,7 @@ class PETRHead(AnchorFreeHead):
         #         self.positional_encoding(mlvl_masks[-1]))
 
         query_embeds = self.query_embedding.weight
+        dn_meta = self._prepare_dn_queries(gt_keypoints_list)
         hs, init_reference, inter_references, \
             enc_outputs_class, enc_outputs_kpt, memory = \
                 self.transformer(
@@ -262,7 +353,15 @@ class PETRHead(AnchorFreeHead):
                     kpt_branches=self.kpt_branches \
                         if self.with_kpt_refine else None,  # noqa:E501
                     cls_branches=self.cls_branches \
-                        if self.as_two_stage else None  # noqa:E501
+                        if self.as_two_stage else None,  # noqa:E501
+                    dn_query=dn_meta['query'] if dn_meta is not None else None,
+                    dn_query_pos=dn_meta['query_pos'] if dn_meta is not None else None,
+                    dn_reference_points=dn_meta['reference_points'] \
+                        if dn_meta is not None else None,
+                    dn_attn_mask=dn_meta['attn_mask'] \
+                        if dn_meta is not None else None,
+                    dn_query_padding_mask=dn_meta['query_padding_mask'] \
+                        if dn_meta is not None else None
             )
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
@@ -285,9 +384,20 @@ class PETRHead(AnchorFreeHead):
         outputs_classes = torch.stack(outputs_classes)
         outputs_kpts = torch.stack(outputs_kpts)
 
+        dn_outputs = None
+        if dn_meta is not None:
+            pad_size = dn_meta['pad_size']
+            dn_outputs = (outputs_classes[:, :, :pad_size],
+                          outputs_kpts[:, :, :pad_size], dn_meta)
+            outputs_classes = outputs_classes[:, :, pad_size:]
+            outputs_kpts = outputs_kpts[:, :, pad_size:]
+
         if self.as_two_stage:
-            return outputs_classes, outputs_kpts, \
-                enc_outputs_class, enc_outputs_kpt, memory
+            outputs = (outputs_classes, outputs_kpts,
+                       enc_outputs_class, enc_outputs_kpt)
+            if dn_outputs is not None:
+                return outputs + (dn_outputs, memory)
+            return outputs + (memory, )
         else:
             raise RuntimeError('only "as_two_stage=True" is supported.')
 
@@ -396,9 +506,10 @@ class PETRHead(AnchorFreeHead):
             dict[str, Tensor]: A dictionary of loss components.
         """
         assert proposal_cfg is None, '"proposal_cfg" must be None'
-        outs = self(x, img_metas)
+        outs = self(x, img_metas, gt_keypoints)
         memory = outs[-1]
-        outs = outs[:-1]
+        dn_outputs = outs[-2] if len(outs) == 6 else None
+        outs = outs[:4]
         if gt_labels is None:
             loss_inputs = outs + (gt_bboxes, gt_keypoints, gt_areas, img_metas)
         else:
@@ -407,9 +518,41 @@ class PETRHead(AnchorFreeHead):
         losses_and_targets = self.loss(
             *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         losses, refine_targets = losses_and_targets
+        if dn_outputs is not None:
+            losses.update(self.loss_dn(*dn_outputs))
         # get pose refinement loss
         losses = self.forward_refine(memory, refine_targets,
                                      losses, img_metas)
+        return losses
+
+    def loss_dn(self, dn_cls_scores, dn_kpt_preds, dn_meta):
+        """Compute direct reconstruction losses for positive DN queries."""
+        targets = dn_meta['targets']
+        valid_mask = dn_meta['valid_mask']
+        pose_weights = valid_mask.unsqueeze(-1).expand_as(targets).to(
+            targets.dtype)
+        labels = torch.zeros_like(valid_mask, dtype=torch.long)
+        label_weights = valid_mask.to(targets.dtype)
+        num_valid = max(valid_mask.sum().item(), 1)
+        num_valid_coords = max(pose_weights.sum().item(), 1)
+        losses = {}
+
+        for layer_idx, (cls_scores, kpt_preds) in enumerate(
+                zip(dn_cls_scores, dn_kpt_preds)):
+            loss_cls = self.loss_cls(
+                cls_scores.reshape(-1, self.cls_out_channels),
+                labels.reshape(-1),
+                label_weights.reshape(-1),
+                avg_factor=num_valid)
+            loss_kpt = self.loss_kpt(
+                kpt_preds.reshape(-1, kpt_preds.size(-1)),
+                targets.reshape(-1, targets.size(-1)),
+                pose_weights.reshape(-1, pose_weights.size(-1)),
+                avg_factor=num_valid_coords)
+            prefix = 'dn_' if layer_idx == len(dn_cls_scores) - 1 \
+                else f'dn_d{layer_idx}.'
+            losses[f'{prefix}loss_cls'] = loss_cls
+            losses[f'{prefix}loss_kpt'] = loss_kpt
         return losses
 
     @force_fp32(apply_to=('all_cls_scores', 'all_kpt_preds'))

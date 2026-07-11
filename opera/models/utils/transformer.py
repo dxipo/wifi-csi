@@ -430,6 +430,11 @@ class PETRTransformer(Transformer):
                 query_embed,
                 kpt_branches=None,
                 cls_branches=None,
+                dn_query=None,
+                dn_query_pos=None,
+                dn_reference_points=None,
+                dn_attn_mask=None,
+                dn_query_padding_mask=None,
                 **kwargs):
         """Forward function for `Transformer`.
 
@@ -516,6 +521,13 @@ class PETRTransformer(Transformer):
             reference_points = self.reference_points(query_pos)
             init_reference_out = reference_points
 
+        if dn_reference_points is not None:
+            reference_points = torch.cat(
+                [dn_reference_points, reference_points], dim=1)
+            query_pos = torch.cat([dn_query_pos, query_pos], dim=1)
+            query = torch.cat([dn_query, query], dim=1)
+            init_reference_out = reference_points
+
         # decoder
         query = query.permute(1, 0, 2)
         memory = memory.permute(1, 0, 2)
@@ -528,6 +540,9 @@ class PETRTransformer(Transformer):
             query_pos=query_pos,
             reference_points=reference_points,
             kpt_branches=kpt_branches,
+            attn_masks=[dn_attn_mask, None] \
+                if dn_attn_mask is not None else None,
+            query_key_padding_mask=dn_query_padding_mask,
             **kwargs)
 
         inter_references_out = inter_references
