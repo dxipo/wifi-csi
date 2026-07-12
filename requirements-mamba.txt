@@ -1,0 +1,5 @@
+# Install after the base wifi3d environment with --no-build-isolation.
+mamba-ssm==1.2.2
+einops==0.8.0
+transformers==4.39.3
+ninja==1.11.1.1

@@ -410,8 +410,14 @@ class PETRTransformer(Transformer):
 
     def init_weights(self):
         """Initialize the transformer weights."""
+        skip_xavier = {
+            id(p)
+            for module in self.modules()
+            if getattr(module, 'skip_global_xavier_init', False)
+            for p in module.parameters()
+        }
         for p in self.parameters():
-            if p.dim() > 1:
+            if p.dim() > 1 and id(p) not in skip_xavier:
                 nn.init.xavier_uniform_(p)
         for m in self.modules():
             if isinstance(m, MultiScaleDeformableAttention):
