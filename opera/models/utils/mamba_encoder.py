@@ -20,7 +20,8 @@ class MambaEncoderLayer(nn.Module):
                  d_state=16,
                  d_conv=4,
                  expand=2,
-                 dropout=0.1):
+                 dropout=0.1,
+                 bidirectional=False):
         super().__init__()
         if Mamba is None:
             raise ImportError(
@@ -31,9 +32,17 @@ class MambaEncoderLayer(nn.Module):
         self.mixer = Mamba(
             d_model=embed_dims, d_state=d_state, d_conv=d_conv, expand=expand)
         self.dropout = nn.Dropout(dropout)
+        self.bidirectional = bidirectional
 
     def forward(self, x):
-        return x + self.dropout(self.mixer(self.norm(x)))
+        normed = self.norm(x)
+        mixed = self.mixer(normed)
+        if self.bidirectional:
+            reversed_x = normed.flip(dims=(1, )).contiguous()
+            reversed_y = self.mixer(reversed_x)
+            backward = reversed_y.flip(dims=(1, )).contiguous()
+            mixed = 0.5 * (mixed + backward)
+        return x + self.dropout(mixed)
 
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
@@ -41,9 +50,9 @@ class MambaEncoder(nn.Module):
     """Mamba replacement for the PETR Transformer encoder.
 
     PETR/MMCV passes encoder features as ``[length, batch, channels]`` while
-    Mamba expects ``[batch, length, channels]``. M0 intentionally scans the
-    existing 30 flattened CSI tokens in their current order so that the
-    encoder family is the only experimental variable.
+    Mamba expects ``[batch, length, channels]``. M0 scans the existing 30
+    flattened CSI tokens in one direction. M1 optionally averages forward and
+    reverse scans from the same mixer, preserving the M0 parameter count.
     """
 
     skip_global_xavier_init = True
@@ -55,17 +64,20 @@ class MambaEncoder(nn.Module):
                  d_conv=4,
                  expand=2,
                  dropout=0.1,
+                 bidirectional=False,
                  final_norm=True):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         self.layers = nn.ModuleList([
             MambaEncoderLayer(
                 embed_dims=embed_dims,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
-                dropout=dropout) for _ in range(num_layers)
+                dropout=dropout,
+                bidirectional=bidirectional) for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(
             embed_dims) if final_norm else nn.Identity()
