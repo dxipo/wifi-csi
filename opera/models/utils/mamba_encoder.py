@@ -21,7 +21,10 @@ class MambaEncoderLayer(nn.Module):
                  d_conv=4,
                  expand=2,
                  dropout=0.1,
-                 bidirectional=False):
+                 bidirectional=False,
+                 multi_order=False,
+                 num_antennas=3,
+                 num_time_steps=10):
         super().__init__()
         if Mamba is None:
             raise ImportError(
@@ -33,15 +36,45 @@ class MambaEncoderLayer(nn.Module):
             d_model=embed_dims, d_state=d_state, d_conv=d_conv, expand=expand)
         self.dropout = nn.Dropout(dropout)
         self.bidirectional = bidirectional
+        self.multi_order = multi_order
+        self.num_antennas = num_antennas
+        self.num_time_steps = num_time_steps
 
-    def forward(self, x):
-        normed = self.norm(x)
-        mixed = self.mixer(normed)
+    def scan(self, x):
+        mixed = self.mixer(x)
         if self.bidirectional:
-            reversed_x = normed.flip(dims=(1, )).contiguous()
+            reversed_x = x.flip(dims=(1, )).contiguous()
             reversed_y = self.mixer(reversed_x)
             backward = reversed_y.flip(dims=(1, )).contiguous()
             mixed = 0.5 * (mixed + backward)
+        return mixed
+
+    def reorder_link_first(self, x):
+        batch, length, channels = x.shape
+        expected = self.num_antennas * self.num_time_steps
+        if length != expected:
+            raise ValueError(
+                f'Multi-order Mamba expects {self.num_antennas} antennas x '
+                f'{self.num_time_steps} time steps = {expected} tokens, got '
+                f'{length}')
+        return (x.reshape(batch, self.num_antennas, self.num_time_steps,
+                          channels).permute(0, 2, 1, 3).contiguous().reshape(
+                              batch, length, channels))
+
+    def restore_time_first(self, x):
+        batch, length, channels = x.shape
+        return (x.reshape(batch, self.num_time_steps, self.num_antennas,
+                          channels).permute(0, 2, 1, 3).contiguous().reshape(
+                              batch, length, channels))
+
+    def forward(self, x):
+        normed = self.norm(x)
+        mixed = self.scan(normed)
+        if self.multi_order:
+            link_first = self.reorder_link_first(normed)
+            link_first = self.scan(link_first)
+            link_first = self.restore_time_first(link_first)
+            mixed = 0.5 * (mixed + link_first)
         return x + self.dropout(mixed)
 
 
@@ -52,7 +85,9 @@ class MambaEncoder(nn.Module):
     PETR/MMCV passes encoder features as ``[length, batch, channels]`` while
     Mamba expects ``[batch, length, channels]``. M0 scans the existing 30
     flattened CSI tokens in one direction. M1 optionally averages forward and
-    reverse scans from the same mixer, preserving the M0 parameter count.
+    reverse scans from the same mixer, preserving the M0 parameter count. M2
+    can additionally scan antenna-major and time-major token orders with that
+    same mixer before restoring and fusing their canonical token positions.
     """
 
     skip_global_xavier_init = True
@@ -65,11 +100,17 @@ class MambaEncoder(nn.Module):
                  expand=2,
                  dropout=0.1,
                  bidirectional=False,
+                 multi_order=False,
+                 num_antennas=3,
+                 num_time_steps=10,
                  final_norm=True):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_layers = num_layers
         self.bidirectional = bidirectional
+        self.multi_order = multi_order
+        self.num_antennas = num_antennas
+        self.num_time_steps = num_time_steps
         self.layers = nn.ModuleList([
             MambaEncoderLayer(
                 embed_dims=embed_dims,
@@ -77,7 +118,10 @@ class MambaEncoder(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
-                bidirectional=bidirectional) for _ in range(num_layers)
+                bidirectional=bidirectional,
+                multi_order=multi_order,
+                num_antennas=num_antennas,
+                num_time_steps=num_time_steps) for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(
             embed_dims) if final_norm else nn.Identity()
