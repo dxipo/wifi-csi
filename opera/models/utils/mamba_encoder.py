@@ -1,4 +1,5 @@
 # Copyright (c) Hikvision Research Institute. All rights reserved.
+import torch
 import torch.nn as nn
 
 from .builder import TRANSFORMER_LAYER_SEQUENCE
@@ -21,7 +22,12 @@ class MambaEncoderLayer(nn.Module):
                  d_conv=4,
                  expand=2,
                  dropout=0.1,
-                 bidirectional=False):
+                 bidirectional=False,
+                 use_local_conv=False,
+                 local_kernel_size=3,
+                 local_init_scale=0.1,
+                 num_antennas=3,
+                 num_time_steps=10):
         super().__init__()
         if Mamba is None:
             raise ImportError(
@@ -33,6 +39,39 @@ class MambaEncoderLayer(nn.Module):
             d_model=embed_dims, d_state=d_state, d_conv=d_conv, expand=expand)
         self.dropout = nn.Dropout(dropout)
         self.bidirectional = bidirectional
+        self.use_local_conv = use_local_conv
+        self.num_antennas = num_antennas
+        self.num_time_steps = num_time_steps
+        if use_local_conv:
+            if local_kernel_size <= 0 or local_kernel_size % 2 != 1:
+                raise ValueError('local_kernel_size must be a positive odd integer')
+            self.local_conv = nn.Conv2d(
+                embed_dims,
+                embed_dims,
+                kernel_size=local_kernel_size,
+                padding=local_kernel_size // 2,
+                groups=embed_dims)
+            self.local_activation = nn.GELU()
+            self.local_scale = nn.Parameter(
+                torch.full((embed_dims, ), float(local_init_scale)))
+        else:
+            self.local_conv = None
+            self.local_activation = None
+            self.local_scale = None
+
+    def local_context(self, x):
+        batch, length, channels = x.shape
+        expected = self.num_antennas * self.num_time_steps
+        if length != expected:
+            raise ValueError(
+                f'Local Conv expects {self.num_antennas} antennas x '
+                f'{self.num_time_steps} time steps = {expected} tokens, got '
+                f'{length}')
+        grid = x.reshape(batch, self.num_antennas, self.num_time_steps,
+                         channels).permute(0, 3, 1, 2).contiguous()
+        local = self.local_activation(self.local_conv(grid))
+        return local.permute(0, 2, 3, 1).contiguous().reshape(
+            batch, length, channels)
 
     def forward(self, x):
         normed = self.norm(x)
@@ -42,6 +81,9 @@ class MambaEncoderLayer(nn.Module):
             reversed_y = self.mixer(reversed_x)
             backward = reversed_y.flip(dims=(1, )).contiguous()
             mixed = 0.5 * (mixed + backward)
+        if self.use_local_conv:
+            local = self.local_context(normed)
+            mixed = mixed + local * self.local_scale.view(1, 1, -1)
         return x + self.dropout(mixed)
 
 
@@ -52,7 +94,8 @@ class MambaEncoder(nn.Module):
     PETR/MMCV passes encoder features as ``[length, batch, channels]`` while
     Mamba expects ``[batch, length, channels]``. M0 scans the existing 30
     flattened CSI tokens in one direction. M1 optionally averages forward and
-    reverse scans from the same mixer, preserving the M0 parameter count.
+    reverse scans from the same mixer, preserving the M0 parameter count. M3
+    optionally adds a depthwise Local Conv branch over the antenna-time grid.
     """
 
     skip_global_xavier_init = True
@@ -65,11 +108,19 @@ class MambaEncoder(nn.Module):
                  expand=2,
                  dropout=0.1,
                  bidirectional=False,
+                 use_local_conv=False,
+                 local_kernel_size=3,
+                 local_init_scale=0.1,
+                 num_antennas=3,
+                 num_time_steps=10,
                  final_norm=True):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_layers = num_layers
         self.bidirectional = bidirectional
+        self.use_local_conv = use_local_conv
+        self.num_antennas = num_antennas
+        self.num_time_steps = num_time_steps
         self.layers = nn.ModuleList([
             MambaEncoderLayer(
                 embed_dims=embed_dims,
@@ -77,7 +128,12 @@ class MambaEncoder(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
-                bidirectional=bidirectional) for _ in range(num_layers)
+                bidirectional=bidirectional,
+                use_local_conv=use_local_conv,
+                local_kernel_size=local_kernel_size,
+                local_init_scale=local_init_scale,
+                num_antennas=num_antennas,
+                num_time_steps=num_time_steps) for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(
             embed_dims) if final_norm else nn.Identity()
