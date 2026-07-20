@@ -714,6 +714,9 @@ class MMFiPoseDataset(dataset):
         mpjpe_x = []
         mpjpe_y = []
         mpjpe_z = []
+        pck_thresholds_mm = (5, 10, 20, 50)
+        pck_hits = {threshold: 0 for threshold in pck_thresholds_mm}
+        pck_joint_count = 0
 
         for index, result in enumerate(results):
             gt = self.get_gt_keypoints(index)
@@ -721,10 +724,14 @@ class MMFiPoseDataset(dataset):
             if pred is None:
                 continue
             err = np.linalg.norm(pred - gt, axis=-1)
-            mpjpe_abs.append(err.mean() * 1000.0)
+            err_mm = err * 1000.0
+            mpjpe_abs.append(err_mm.mean())
             mpjpe_x.append(np.abs(pred[:, 0] - gt[:, 0]).mean() * 1000.0)
             mpjpe_y.append(np.abs(pred[:, 1] - gt[:, 1]).mean() * 1000.0)
             mpjpe_z.append(np.abs(pred[:, 2] - gt[:, 2]).mean() * 1000.0)
+            for threshold in pck_thresholds_mm:
+                pck_hits[threshold] += int(np.count_nonzero(err_mm <= threshold))
+            pck_joint_count += int(err_mm.size)
 
             pred_rel = pred - self.pelvis(pred)
             gt_rel = gt - self.pelvis(gt)
@@ -741,7 +748,11 @@ class MMFiPoseDataset(dataset):
                 pa_mpjpe=np.nan,
                 mpjpe_x=np.nan,
                 mpjpe_y=np.nan,
-                mpjpe_z=np.nan)
+                mpjpe_z=np.nan,
+                pck_5=np.nan,
+                pck_10=np.nan,
+                pck_20=np.nan,
+                pck_50=np.nan)
 
         result = OrderedDict()
         result['mpjpe'] = float(np.mean(mpjpe_abs))
@@ -751,6 +762,9 @@ class MMFiPoseDataset(dataset):
         result['mpjpe_x'] = float(np.mean(mpjpe_x))
         result['mpjpe_y'] = float(np.mean(mpjpe_y))
         result['mpjpe_z'] = float(np.mean(mpjpe_z))
+        for threshold in pck_thresholds_mm:
+            result[f'pck_{threshold}'] = float(
+                100.0 * pck_hits[threshold] / pck_joint_count)
         return result
 
     def select_prediction(self, result, gt):
