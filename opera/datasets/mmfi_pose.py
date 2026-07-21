@@ -714,9 +714,13 @@ class MMFiPoseDataset(dataset):
         mpjpe_x = []
         mpjpe_y = []
         mpjpe_z = []
-        pck_thresholds_mm = (5, 10, 20, 50)
-        pck_hits = {threshold: 0 for threshold in pck_thresholds_mm}
+        # WiFlow normalizes each joint error by the sample's GT scale from the
+        # right shoulder to the left hip. MMFi uses Human3.6M-17 ordering, so
+        # these joints are indices 14 and 4 respectively.
+        pck_thresholds = (5, 10, 20, 50)
+        pck_hits = {threshold: 0 for threshold in pck_thresholds}
         pck_joint_count = 0
+        pck_reference_scales_mm = []
 
         for index, result in enumerate(results):
             gt = self.get_gt_keypoints(index)
@@ -729,9 +733,15 @@ class MMFiPoseDataset(dataset):
             mpjpe_x.append(np.abs(pred[:, 0] - gt[:, 0]).mean() * 1000.0)
             mpjpe_y.append(np.abs(pred[:, 1] - gt[:, 1]).mean() * 1000.0)
             mpjpe_z.append(np.abs(pred[:, 2] - gt[:, 2]).mean() * 1000.0)
-            for threshold in pck_thresholds_mm:
-                pck_hits[threshold] += int(np.count_nonzero(err_mm <= threshold))
-            pck_joint_count += int(err_mm.size)
+            reference_scale = np.linalg.norm(gt[14] - gt[4])
+            if reference_scale > 1e-8:
+                normalized_err = err / reference_scale
+                for threshold in pck_thresholds:
+                    alpha = threshold / 100.0
+                    pck_hits[threshold] += int(
+                        np.count_nonzero(normalized_err <= alpha))
+                pck_joint_count += int(normalized_err.size)
+                pck_reference_scales_mm.append(reference_scale * 1000.0)
 
             pred_rel = pred - self.pelvis(pred)
             gt_rel = gt - self.pelvis(gt)
@@ -752,7 +762,8 @@ class MMFiPoseDataset(dataset):
                 pck_5=np.nan,
                 pck_10=np.nan,
                 pck_20=np.nan,
-                pck_50=np.nan)
+                pck_50=np.nan,
+                pck_reference_scale_mm=np.nan)
 
         result = OrderedDict()
         result['mpjpe'] = float(np.mean(mpjpe_abs))
@@ -762,9 +773,13 @@ class MMFiPoseDataset(dataset):
         result['mpjpe_x'] = float(np.mean(mpjpe_x))
         result['mpjpe_y'] = float(np.mean(mpjpe_y))
         result['mpjpe_z'] = float(np.mean(mpjpe_z))
-        for threshold in pck_thresholds_mm:
-            result[f'pck_{threshold}'] = float(
-                100.0 * pck_hits[threshold] / pck_joint_count)
+        for threshold in pck_thresholds:
+            result[f'pck_{threshold}'] = (
+                float(100.0 * pck_hits[threshold] / pck_joint_count)
+                if pck_joint_count else np.nan)
+        result['pck_reference_scale_mm'] = (
+            float(np.mean(pck_reference_scales_mm))
+            if pck_reference_scales_mm else np.nan)
         return result
 
     def select_prediction(self, result, gt):
