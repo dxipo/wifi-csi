@@ -719,7 +719,17 @@ class MMFiPoseDataset(dataset):
         # these joints are indices 14 and 4 respectively.
         pck_thresholds = (5, 10, 20, 30, 40, 50)
         pck_hits = {threshold: 0 for threshold in pck_thresholds}
+        pck_joint_names = (
+            'bot_torso', 'r_hip', 'r_knee', 'r_foot', 'l_hip', 'l_knee',
+            'l_foot', 'center_torso', 'upper_torso', 'neck_base',
+            'center_head', 'l_shoulder', 'l_elbow', 'l_hand', 'r_shoulder',
+            'r_elbow', 'r_hand')
+        pck_joint_hits = {
+            threshold: np.zeros(len(pck_joint_names), dtype=np.int64)
+            for threshold in pck_thresholds
+        }
         pck_joint_count = 0
+        pck_sample_count = 0
         pck_reference_scales_mm = []
 
         for index, result in enumerate(results):
@@ -738,9 +748,11 @@ class MMFiPoseDataset(dataset):
                 normalized_err = err / reference_scale
                 for threshold in pck_thresholds:
                     alpha = threshold / 100.0
-                    pck_hits[threshold] += int(
-                        np.count_nonzero(normalized_err <= alpha))
+                    correct = normalized_err <= alpha
+                    pck_hits[threshold] += int(np.count_nonzero(correct))
+                    pck_joint_hits[threshold] += correct.astype(np.int64)
                 pck_joint_count += int(normalized_err.size)
+                pck_sample_count += 1
                 pck_reference_scales_mm.append(reference_scale * 1000.0)
 
             pred_rel = pred - self.pelvis(pred)
@@ -779,6 +791,11 @@ class MMFiPoseDataset(dataset):
             result[f'pck_{threshold}'] = (
                 float(100.0 * pck_hits[threshold] / pck_joint_count)
                 if pck_joint_count else np.nan)
+            for joint_index, joint_name in enumerate(pck_joint_names):
+                result[f'pck_{threshold}_{joint_name}'] = (
+                    float(100.0 * pck_joint_hits[threshold][joint_index]
+                          / pck_sample_count)
+                    if pck_sample_count else np.nan)
         result['pck_reference_scale_mm'] = (
             float(np.mean(pck_reference_scales_mm))
             if pck_reference_scales_mm else np.nan)
