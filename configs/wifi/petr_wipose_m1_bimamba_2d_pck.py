@@ -77,7 +77,7 @@ model = dict(
 evaluation = dict(
     interval=1, metric='pck', save_best='pck50', rule='greater')
 checkpoint_config = dict(interval=5, max_keep_ckpts=10)
-lr_config = dict(policy='step', step=[40])
-runner = dict(type='EpochBasedRunner', max_epochs=50)
+lr_config = dict(policy='step', step=[60])
+runner = dict(type='EpochBasedRunner', max_epochs=80)
 
 work_dir = 'result/wipose_m1_bimamba_2d_pck'
