@@ -717,7 +717,7 @@ class MMFiPoseDataset(dataset):
         # WiFlow normalizes each joint error by the sample's GT scale from the
         # right shoulder to the left hip. MMFi uses Human3.6M-17 ordering, so
         # these joints are indices 14 and 4 respectively.
-        pck_thresholds = (5, 10, 20, 50)
+        pck_thresholds = (5, 10, 20, 30, 40, 50)
         pck_hits = {threshold: 0 for threshold in pck_thresholds}
         pck_joint_count = 0
         pck_reference_scales_mm = []
@@ -762,6 +762,8 @@ class MMFiPoseDataset(dataset):
                 pck_5=np.nan,
                 pck_10=np.nan,
                 pck_20=np.nan,
+                pck_30=np.nan,
+                pck_40=np.nan,
                 pck_50=np.nan,
                 pck_reference_scale_mm=np.nan)
 
