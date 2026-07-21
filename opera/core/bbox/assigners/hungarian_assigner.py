@@ -39,10 +39,12 @@ class PoseHungarianAssigner(BaseAssigner):
     def __init__(self,
                  cls_cost=dict(type='ClassificationCost', weight=1.0),
                  kpt_cost=dict(type='KptL1Cost', weight=1.0),
-                 oks_cost=dict(type='OksCost', weight=1.0)):
+                 oks_cost=dict(type='OksCost', weight=1.0),
+                 coordinate_dims=3):
         self.cls_cost = build_match_cost(cls_cost)
         self.kpt_cost = build_match_cost(kpt_cost)
         self.oks_cost = build_match_cost(oks_cost)
+        self.coordinate_dims = coordinate_dims
 
 
     def assign(self,
@@ -109,10 +111,10 @@ class PoseHungarianAssigner(BaseAssigner):
 
         # keypoint regression L1 cost
         gt_keypoints_reshape = gt_keypoints.reshape(gt_keypoints.shape[0], -1,
-                                                    3)
+                                                    self.coordinate_dims)
         valid_kpt_flag = gt_keypoints_reshape.new_ones(([num_gts, gt_keypoints_reshape.shape[1]]))
         kpt_pred_tmp = kpt_pred.clone().detach().reshape(
-            kpt_pred.shape[0], -1, 3)
+            kpt_pred.shape[0], -1, self.coordinate_dims)
 
         kpt_cost = self.kpt_cost(kpt_pred_tmp, gt_keypoints_reshape,
                                  valid_kpt_flag)

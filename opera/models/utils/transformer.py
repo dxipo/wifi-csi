@@ -211,11 +211,13 @@ class PetrTransformerDecoder(TransformerLayerSequence):
                  *args,
                  return_intermediate=False,
                  num_keypoints=17,
+                 coordinate_dims=3,
                  **kwargs):
 
         super(PetrTransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
         self.num_keypoints = num_keypoints
+        self.coordinate_dims = coordinate_dims
 
     def forward(self,
                 query,
@@ -253,7 +255,8 @@ class PetrTransformerDecoder(TransformerLayerSequence):
 
             if kpt_branches is not None:
                 tmp = kpt_branches[lid](output)
-                if reference_points.shape[-1] == self.num_keypoints * 3:
+                if reference_points.shape[-1] == (
+                        self.num_keypoints * self.coordinate_dims):
                     new_reference_points = tmp + reference_points
                     new_reference_points = new_reference_points
                 else:
@@ -281,10 +284,15 @@ class PetrRefineTransformerDecoder(TransformerLayerSequence):
             `LN`.
     """
 
-    def __init__(self, *args, return_intermediate=False, **kwargs):
+    def __init__(self,
+                 *args,
+                 return_intermediate=False,
+                 coordinate_dims=3,
+                 **kwargs):
 
         super(PetrRefineTransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
+        self.coordinate_dims = coordinate_dims
 
     def forward(self,
                 query,
@@ -318,7 +326,7 @@ class PetrRefineTransformerDecoder(TransformerLayerSequence):
         intermediate = []
         intermediate_reference_points = []
         for lid, layer in enumerate(self.layers):
-            assert reference_points.shape[-1] == 3
+            assert reference_points.shape[-1] == self.coordinate_dims
             output = layer(
                 output,
                 *args,
@@ -327,10 +335,10 @@ class PetrRefineTransformerDecoder(TransformerLayerSequence):
 
             if reg_branches is not None:
                 tmp = reg_branches[lid](output)
-                assert reference_points.shape[-1] == 3
+                assert reference_points.shape[-1] == self.coordinate_dims
                 new_reference_points = tmp
-                new_reference_points[..., :3] = tmp[
-                    ..., :3] + reference_points
+                new_reference_points[..., :self.coordinate_dims] = tmp[
+                    ..., :self.coordinate_dims] + reference_points
                 new_reference_points = new_reference_points
                 reference_points = new_reference_points.detach()
 
@@ -384,6 +392,7 @@ class PETRTransformer(Transformer):
                  num_feature_levels=4,
                  two_stage_num_proposals=100,
                  num_keypoints=17,
+                 coordinate_dims=3,
                  **kwargs):
         super(PETRTransformer, self).__init__(**kwargs)
         self.as_two_stage = as_two_stage
@@ -391,6 +400,7 @@ class PETRTransformer(Transformer):
         self.two_stage_num_proposals = two_stage_num_proposals
         self.embed_dims = self.encoder.embed_dims
         self.num_keypoints = num_keypoints
+        self.coordinate_dims = coordinate_dims
         self.init_layers()
         self.refine_decoder = build_transformer_layer_sequence(refine_decoder)
 
@@ -561,7 +571,8 @@ class PETRTransformer(Transformer):
         query = query.unsqueeze(0).expand(pos_num, -1, -1)
         reference_points = reference_points_pose.reshape(
             pos_num,
-            reference_points_pose.size(1) // 3, 3)
+            reference_points_pose.size(1) // self.coordinate_dims,
+            self.coordinate_dims)
         query = query.permute(1, 0, 2)
         query_pos = query_pos.permute(1, 0, 2)
         pos_memory = memory[:, img_inds, :]

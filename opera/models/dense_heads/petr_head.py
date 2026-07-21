@@ -60,6 +60,7 @@ class PETRHead(AnchorFreeHead):
                  num_query=100,
                  num_kpt_fcs=2,
                  num_keypoints=17,
+                 coordinate_dims=3,
                  transformer=None,
                  sync_cls_avg_factor=True,
                  positional_encoding=dict(
@@ -130,6 +131,10 @@ class PETRHead(AnchorFreeHead):
         self.as_two_stage = as_two_stage
         self.with_kpt_refine = with_kpt_refine
         self.num_keypoints = num_keypoints
+        if coordinate_dims not in (2, 3):
+            raise ValueError(
+                f'coordinate_dims must be 2 or 3, got {coordinate_dims}')
+        self.coordinate_dims = coordinate_dims
         self.teacher_embed_dims = teacher_embed_dims
         self.decoder_token_distill_weight = decoder_token_distill_weight
         self.decoder_relation_distill_weight = decoder_relation_distill_weight
@@ -150,6 +155,7 @@ class PETRHead(AnchorFreeHead):
             if src < num_keypoints and dst < num_keypoints)
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
+            transformer['coordinate_dims'] = self.coordinate_dims
         else:
             raise RuntimeError('only "as_two_stage=True" is supported.')
         self.loss_cls = build_loss(loss_cls)
@@ -195,7 +201,8 @@ class PETRHead(AnchorFreeHead):
         for _ in range(self.num_kpt_fcs):
             kpt_branch.append(Linear(512, 512))
             kpt_branch.append(nn.ReLU())
-        kpt_branch.append(Linear(512, 3 * self.num_keypoints))
+        kpt_branch.append(
+            Linear(512, self.coordinate_dims * self.num_keypoints))
         kpt_branch = nn.Sequential(*kpt_branch)
 
         def _get_clones(module, N):
@@ -222,7 +229,7 @@ class PETRHead(AnchorFreeHead):
         for _ in range(self.num_kpt_fcs):
             refine_kpt_branch.append(Linear(self.embed_dims, self.embed_dims))
             refine_kpt_branch.append(nn.ReLU())
-        refine_kpt_branch.append(Linear(self.embed_dims, 3))
+        refine_kpt_branch.append(Linear(self.embed_dims, self.coordinate_dims))
         refine_kpt_branch = nn.Sequential(*refine_kpt_branch)
         if self.with_kpt_refine:
             num_pred = self.transformer.refine_decoder.num_layers
@@ -231,7 +238,8 @@ class PETRHead(AnchorFreeHead):
                 root_branch = []
                 root_branch.append(Linear(self.embed_dims, self.embed_dims))
                 root_branch.append(nn.ReLU())
-                root_branch.append(Linear(self.embed_dims, 3))
+                root_branch.append(
+                    Linear(self.embed_dims, self.coordinate_dims))
                 self.refine_root_branches = _get_clones(
                     nn.Sequential(*root_branch), num_pred)
         self.fc_hm = Linear(self.embed_dims, self.num_keypoints)
@@ -325,7 +333,8 @@ class PETRHead(AnchorFreeHead):
             # reference = inverse_sigmoid(reference)
             outputs_class = self.cls_branches[lvl](hs[lvl])
             tmp_kpt = self.kpt_branches[lvl](hs[lvl])
-            assert reference.shape[-1] == self.num_keypoints * 3
+            assert reference.shape[-1] == (
+                self.num_keypoints * self.coordinate_dims)
             tmp_kpt += reference
             outputs_kpt = tmp_kpt
             outputs_classes.append(outputs_class)
@@ -378,7 +387,7 @@ class PETRHead(AnchorFreeHead):
             else:
                 reference = inter_references[lvl - 1]
             tmp_kpt = self.refine_kpt_branches[lvl](hs[lvl])
-            assert reference.shape[-1] == 3
+            assert reference.shape[-1] == self.coordinate_dims
             tmp_kpt += reference
             if self.root_decoupled:
                 root_offset = self.refine_root_branches[lvl](
@@ -558,8 +567,10 @@ class PETRHead(AnchorFreeHead):
                 losses['loss_axis_gt'] = zero
             return losses
 
-        pred_kpts = pred_kpts.reshape(-1, self.num_keypoints, 3)
-        target = target_kpts.reshape(-1, self.num_keypoints, 3)
+        pred_kpts = pred_kpts.reshape(
+            -1, self.num_keypoints, self.coordinate_dims)
+        target = target_kpts.reshape(
+            -1, self.num_keypoints, self.coordinate_dims)
         if self.rel_pose_loss_weight > 0:
             pred_rel = pred_kpts - self.pelvis(pred_kpts)
             target_rel = target - self.pelvis(target)
@@ -578,22 +589,23 @@ class PETRHead(AnchorFreeHead):
                 F.smooth_l1_loss(pred_root, target_root, reduction='mean') *
                 self.root_pose_loss_weight)
             root_abs_error = (pred_root - target_root).abs().mean(dim=(0, 1))
-            losses['root_abs_x'] = root_abs_error[0].detach()
-            losses['root_abs_y'] = root_abs_error[1].detach()
-            losses['root_abs_z'] = root_abs_error[2].detach()
+            axis_names = ('x', 'y', 'z')
+            for axis, error in zip(axis_names, root_abs_error):
+                losses[f'root_abs_{axis}'] = error.detach()
 
         if self.axis_pose_loss_weight > 0:
             axis_weights = pred_kpts.new_tensor(
-                self.axis_loss_weights).view(1, 1, 3)
+                self.axis_loss_weights[:self.coordinate_dims]).view(
+                    1, 1, self.coordinate_dims)
             axis_error = F.smooth_l1_loss(
                 pred_kpts, target, reduction='none')
             losses['loss_axis_gt'] = (
                 (axis_error * axis_weights).mean() *
                 self.axis_pose_loss_weight)
             axis_abs_error = (pred_kpts - target).abs().mean(dim=(0, 1))
-            losses['axis_abs_x'] = axis_abs_error[0].detach()
-            losses['axis_abs_y'] = axis_abs_error[1].detach()
-            losses['axis_abs_z'] = axis_abs_error[2].detach()
+            axis_names = ('x', 'y', 'z')
+            for axis, error in zip(axis_names, axis_abs_error):
+                losses[f'axis_abs_{axis}'] = error.detach()
 
         return losses
 
@@ -737,8 +749,8 @@ class PETRHead(AnchorFreeHead):
                 zip(gt_labels, gt_bboxes, gt_keypoints)):
             if gt_label.size(0) == 0:
                 continue
-            gt_keypoint = gt_keypoint.reshape(gt_keypoint.shape[0], -1,
-                                              3).clone()
+            gt_keypoint = gt_keypoint.reshape(
+                gt_keypoint.shape[0], -1, self.coordinate_dims).clone()
             gt_keypoint[..., :2] /= 8
             assert gt_keypoint[..., 0].max() <= w  # new coordinate system
             assert gt_keypoint[..., 1].max() <= h  # new coordinate system
@@ -752,7 +764,8 @@ class PETRHead(AnchorFreeHead):
                         gaussian_radius((gt_h[j], gt_w[j]), min_overlap=0.9)),
                     min=0, max=3)
                 for k in range(self.num_keypoints):
-                    if gt_keypoint[j, k, 2] > 0:
+                    if (self.coordinate_dims == 2 or
+                            gt_keypoint[j, k, 2] > 0):
                         gt_kp = gt_keypoint[j, k, :2]
                         gt_kp_int = torch.floor(gt_kp)
                         draw_umich_gaussian(hm_target[i, k], gt_kp_int,
@@ -832,10 +845,10 @@ class PETRHead(AnchorFreeHead):
         enp = [2, 3, 4, 6, 8, 10]
         enp = [idx for idx in enp if idx < self.num_keypoints]
         weight_enhance = torch.ones_like(kpt_preds).reshape(
-            -1, self.num_keypoints, 3)
+            -1, self.num_keypoints, self.coordinate_dims)
         weight_enhance[:,enp,:] = weight_enhance[:,enp,:]*3
         weight_enhance = weight_enhance.reshape(
-            -1, self.num_keypoints * 3)
+            -1, self.num_keypoints * self.coordinate_dims)
         '''loss_kpt = self.loss_kpt(
             kpt_preds*weight_enhance, kpt_targets*weight_enhance, kpt_weights, avg_factor=num_valid_kpt)'''
         loss_kpt = self.loss_kpt(
@@ -961,7 +974,9 @@ class PETRHead(AnchorFreeHead):
                                           pos_gt_kpts.shape[1]), dtype = torch.int64)
         valid_idx = valid_idx > 0
         pos_kpt_weights = kpt_weights[pos_inds].reshape(
-            pos_gt_kpts.shape[0], kpt_weights.shape[-1] // 3, 3)
+            pos_gt_kpts.shape[0],
+            kpt_weights.shape[-1] // self.coordinate_dims,
+            self.coordinate_dims)
 
         pos_kpt_weights[valid_idx] = 1.0
         kpt_weights[pos_inds] = pos_kpt_weights.reshape(
@@ -1045,10 +1060,10 @@ class PETRHead(AnchorFreeHead):
         enp = [2, 3, 4, 6, 8, 10]
         enp = [idx for idx in enp if idx < self.num_keypoints]
         weight_enhance = torch.ones_like(kpt_preds).reshape(
-            -1, self.num_keypoints, 3)
+            -1, self.num_keypoints, self.coordinate_dims)
         weight_enhance[:,enp,:] = weight_enhance[:,enp,:]*3
         weight_enhance = weight_enhance.reshape(
-            -1, self.num_keypoints * 3)
+            -1, self.num_keypoints * self.coordinate_dims)
         '''loss_kpt = self.loss_kpt_rpn(
             kpt_preds*weight_enhance, kpt_targets*weight_enhance, kpt_weights, avg_factor=num_valid_kpt)'''
         loss_kpt = self.loss_kpt_rpn(

@@ -143,7 +143,7 @@ def bbox_kpt2result(bboxes, labels, kpts, num_classes):
     """
     if bboxes.shape[0] == 0:
         return [np.zeros((0, 5), dtype=np.float32) for i in range(num_classes)], \
-            [np.zeros((0, kpts.size(1), 3), dtype=np.float32)
+            [np.zeros((0, kpts.size(1), kpts.size(2)), dtype=np.float32)
                 for i in range(num_classes)]
     else:
         if isinstance(bboxes, torch.Tensor):
