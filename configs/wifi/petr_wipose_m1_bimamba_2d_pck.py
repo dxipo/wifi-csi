@@ -30,8 +30,7 @@ wipose_common = dict(
     image_size=(640, 480),
     normalize_csi=False,
     query_selection='top_score',
-    confidence_threshold=0.0,
-    pck_thresholds=(20, 30, 40, 50))
+    confidence_threshold=0.0)
 
 data = dict(
     samples_per_gpu=32,
@@ -75,7 +74,7 @@ model = dict(
     train_cfg=dict(assigner=dict(coordinate_dims=2)))
 
 evaluation = dict(
-    interval=1, metric='pck', save_best='pck50', rule='greater')
+    interval=1, metric='mpjpe', save_best='mpjpe', rule='less')
 checkpoint_config = dict(interval=5, max_keep_ckpts=10)
 lr_config = dict(policy='step', step=[60])
 runner = dict(type='EpochBasedRunner', max_epochs=80)

@@ -30,7 +30,6 @@ class WiPose18Dataset(Dataset):
                  normalize_csi=False,
                  query_selection='top_score',
                  confidence_threshold=0.0,
-                 pck_thresholds=(20, 30, 40, 50),
                  max_samples=None,
                  **kwargs):
         self.data_root = dataset_root
@@ -41,7 +40,6 @@ class WiPose18Dataset(Dataset):
         self.normalize_csi = normalize_csi
         self.query_selection = query_selection
         self.confidence_threshold = float(confidence_threshold)
-        self.pck_thresholds = tuple(int(x) for x in pck_thresholds)
 
         split = 'Train' if mode == 'train' else 'Test'
         split_dir = os.path.join(self.data_root, split)
@@ -91,6 +89,15 @@ class WiPose18Dataset(Dataset):
         # (Tx, Rx, subcarrier, time) -> 45 link-time tokens x 30 features.
         csi = np.transpose(csi, (0, 1, 3, 2))
 
+        joints, confidence = self._decode_skeleton(skeleton, index)
+        return np.ascontiguousarray(csi), joints, confidence
+
+    def load_annotation(self, index):
+        with h5py.File(self.data_infos[index], 'r') as mat:
+            skeleton = np.asarray(mat['SkeletonPoints'][()]).reshape(-1)
+        return self._decode_skeleton(skeleton, index)
+
+    def _decode_skeleton(self, skeleton, index):
         if skeleton.size != len(self.JOINT_NAMES) * 3:
             raise ValueError(
                 f'Expected 54 WiPose label values, got {skeleton.size} '
@@ -98,7 +105,7 @@ class WiPose18Dataset(Dataset):
         skeleton = skeleton.reshape(3, len(self.JOINT_NAMES)).T
         joints = skeleton[:, :2].astype(np.float32)
         confidence = skeleton[:, 2].astype(np.float32)
-        return np.ascontiguousarray(csi), joints, confidence
+        return joints, confidence
 
     @staticmethod
     def _read_numeric(dataset):
@@ -119,20 +126,26 @@ class WiPose18Dataset(Dataset):
 
     def evaluate(self,
                  results,
-                 metric='pck',
+                 metric='mpjpe',
                  logger=None,
                  jsonfile_prefix=None,
                  classwise=False,
                  proposal_nums=(100, 300, 1000),
                  iou_thrs=None,
                  metric_items=None):
-        errors = []
-        valid_masks = []
+        metrics = [metric] if isinstance(metric, str) else list(metric)
+        if metrics != ['mpjpe']:
+            raise KeyError(
+                f'Unsupported WiPose training metric {metric!r}; use mpjpe. '
+                'Compute PCK after inference with tools/eval_wipose_pck.py.')
+
+        mpjpe = []
+        pa_mpjpe = []
         scale = np.array(
             [self.image_width, self.image_height], dtype=np.float32)
 
         for index, result in enumerate(results):
-            _, gt, confidence = self.load_sample(index)
+            gt, confidence = self.load_annotation(index)
             pred = self.select_prediction(result)
             if pred is None:
                 continue
@@ -140,29 +153,25 @@ class WiPose18Dataset(Dataset):
             valid = (np.isfinite(gt).all(axis=-1) &
                      np.isfinite(pred).all(axis=-1) &
                      (confidence >= self.confidence_threshold))
-            errors.append(np.linalg.norm(pred - gt, axis=-1))
-            valid_masks.append(valid)
+            if not valid.any():
+                continue
 
-        if not errors:
-            return OrderedDict(
-                [('mpjpe_pixel', np.nan)] +
-                [(f'pck{threshold}', np.nan)
-                 for threshold in self.pck_thresholds])
+            pred_valid = pred[valid]
+            gt_valid = gt[valid]
+            mpjpe.append(np.linalg.norm(
+                pred_valid - gt_valid, axis=-1).mean())
 
-        errors = np.stack(errors)
-        valid_masks = np.stack(valid_masks)
-        metrics = OrderedDict()
-        metrics['mpjpe_pixel'] = float(errors[valid_masks].mean())
-        for threshold in self.pck_thresholds:
-            correct = errors <= threshold
-            metrics[f'pck{threshold}'] = float(
-                correct[valid_masks].mean() * 100.0)
-            for joint_index, joint_name in enumerate(self.JOINT_NAMES):
-                joint_valid = valid_masks[:, joint_index]
-                value = (correct[joint_valid, joint_index].mean() * 100.0
-                         if joint_valid.any() else np.nan)
-                metrics[f'pck{threshold}/{joint_name}'] = float(value)
-        return metrics
+            pred_aligned = self.compute_similarity_transform(
+                pred_valid, gt_valid)
+            pa_mpjpe.append(np.linalg.norm(
+                pred_aligned - gt_valid, axis=-1).mean())
+
+        if not mpjpe:
+            return OrderedDict(mpjpe=np.nan, pa_mpjpe=np.nan)
+
+        return OrderedDict(
+            mpjpe=float(np.mean(mpjpe)),
+            pa_mpjpe=float(np.mean(pa_mpjpe)))
 
     @staticmethod
     def select_prediction(result):
@@ -178,3 +187,27 @@ class WiPose18Dataset(Dataset):
         else:
             index = 0
         return pred_keypoints[index]
+
+    @staticmethod
+    def compute_similarity_transform(pred, gt):
+        """Align 2D predictions to ground truth with a similarity transform."""
+        pred_t = pred.T
+        gt_t = gt.T
+        mu_pred = pred_t.mean(axis=1, keepdims=True)
+        mu_gt = gt_t.mean(axis=1, keepdims=True)
+        pred_centered = pred_t - mu_pred
+        gt_centered = gt_t - mu_gt
+        var_pred = np.sum(pred_centered ** 2)
+        if var_pred < 1e-12:
+            return pred.copy()
+
+        covariance = pred_centered @ gt_centered.T
+        u, _, vh = np.linalg.svd(covariance)
+        v = vh.T
+        correction = np.eye(2, dtype=np.float32)
+        correction[-1, -1] = np.sign(np.linalg.det(v @ u.T))
+        rotation = v @ correction @ u.T
+        scale = np.trace(rotation @ covariance) / var_pred
+        translation = mu_gt - scale * rotation @ mu_pred
+        aligned = scale * rotation @ pred_t + translation
+        return aligned.T.astype(np.float32)
