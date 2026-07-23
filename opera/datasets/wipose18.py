@@ -1,4 +1,3 @@
-import glob
 import os
 from collections import OrderedDict
 
@@ -9,6 +8,7 @@ from mmdet.datasets.pipelines import Compose
 from torch.utils.data import Dataset
 
 from .builder import DATASETS
+from .wipose_split import build_wipose_data_infos
 
 
 @DATASETS.register_module()
@@ -30,6 +30,9 @@ class WiPose18Dataset(Dataset):
                  normalize_csi=False,
                  query_selection='top_score',
                  confidence_threshold=0.0,
+                 split_strategy='official',
+                 random_ratio=0.8,
+                 random_seed=0,
                  max_samples=None,
                  **kwargs):
         self.data_root = dataset_root
@@ -40,16 +43,18 @@ class WiPose18Dataset(Dataset):
         self.normalize_csi = normalize_csi
         self.query_selection = query_selection
         self.confidence_threshold = float(confidence_threshold)
+        self.split_strategy = split_strategy
+        self.random_ratio = float(random_ratio)
+        self.random_seed = int(random_seed)
 
-        split = 'Train' if mode == 'train' else 'Test'
-        split_dir = os.path.join(self.data_root, split)
-        if not os.path.isdir(split_dir):
-            raise FileNotFoundError(f'WiPose split directory not found: {split_dir}')
-        self.data_infos = sorted(glob.glob(os.path.join(split_dir, '*.mat')))
+        self.data_infos = build_wipose_data_infos(
+            self.data_root,
+            mode,
+            split_strategy=self.split_strategy,
+            random_ratio=self.random_ratio,
+            random_seed=self.random_seed)
         if max_samples is not None:
             self.data_infos = self.data_infos[:int(max_samples)]
-        if not self.data_infos:
-            raise RuntimeError(f'No WiPose .mat samples found under {split_dir}')
         self.flag = np.zeros(len(self.data_infos), dtype=np.uint8)
 
     def __len__(self):

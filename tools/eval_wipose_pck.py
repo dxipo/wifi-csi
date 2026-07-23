@@ -2,13 +2,19 @@
 """Compute torso-normalized WiPose PCK from saved model predictions."""
 
 import argparse
-import glob
 import json
 import os
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import h5py
 import mmcv
 import numpy as np
+
+from opera.datasets.wipose_split import build_wipose_data_infos
 
 
 JOINT_NAMES = (
@@ -31,6 +37,11 @@ def parse_args():
             '/home/xl/CSI/Person-in-WiFi-3D-repo/data/'
             'wipose18_official/Wi-Pose'))
     parser.add_argument('--split', default='Test', choices=['Train', 'Test'])
+    parser.add_argument(
+        '--split-strategy', choices=['official', 'packet_random'],
+        default='official')
+    parser.add_argument('--random-ratio', type=float, default=0.8)
+    parser.add_argument('--random-seed', type=int, default=0)
     parser.add_argument(
         '--thresholds', type=float, nargs='+',
         default=[5, 10, 20, 30, 40, 50],
@@ -90,8 +101,13 @@ def evaluate(args):
         raise ValueError('Pixel diagnostic thresholds must be positive.')
 
     results = mmcv.load(args.predictions)
-    sample_paths = sorted(glob.glob(
-        os.path.join(args.dataset_root, args.split, '*.mat')))
+    mode = 'train' if args.split == 'Train' else 'test'
+    sample_paths = build_wipose_data_infos(
+        args.dataset_root,
+        mode,
+        split_strategy=args.split_strategy,
+        random_ratio=args.random_ratio,
+        random_seed=args.random_seed)
     if len(results) != len(sample_paths):
         raise ValueError(
             f'Prediction/sample count mismatch: {len(results)} vs '
@@ -135,6 +151,11 @@ def evaluate(args):
 
     metrics = {
         'selection': args.selection,
+        'split': {
+            'strategy': args.split_strategy,
+            'random_ratio': args.random_ratio,
+            'random_seed': args.random_seed,
+        },
         'samples': int(errors.shape[0]),
         'valid_keypoints': int(valid_masks.sum()),
         'valid_torso_samples': int(valid_torso.sum()),
