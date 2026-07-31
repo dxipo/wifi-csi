@@ -30,6 +30,7 @@ class WiPose18Dataset(Dataset):
                  normalize_csi=False,
                  query_selection='top_score',
                  confidence_threshold=0.0,
+                 use_keypoint_confidence=False,
                  split_strategy='official',
                  random_ratio=0.8,
                  random_seed=0,
@@ -43,6 +44,7 @@ class WiPose18Dataset(Dataset):
         self.normalize_csi = normalize_csi
         self.query_selection = query_selection
         self.confidence_threshold = float(confidence_threshold)
+        self.use_keypoint_confidence = bool(use_keypoint_confidence)
         self.split_strategy = split_strategy
         self.random_ratio = float(random_ratio)
         self.random_seed = int(random_seed)
@@ -61,10 +63,13 @@ class WiPose18Dataset(Dataset):
         return len(self.data_infos)
 
     def __getitem__(self, index):
-        csi, joints, _ = self.load_sample(index)
+        csi, joints, confidence = self.load_sample(index)
         scale = np.array(
             [self.image_width, self.image_height], dtype=np.float32)
         joints_normalized = joints / scale
+        if self.use_keypoint_confidence:
+            joints_normalized = np.concatenate(
+                [joints_normalized, confidence[:, None]], axis=-1)
 
         result = dict(
             img=torch.from_numpy(csi).float(),

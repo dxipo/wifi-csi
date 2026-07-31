@@ -96,6 +96,8 @@ class PETRHead(AnchorFreeHead):
                  root_pose_loss_weight=0.0,
                  axis_pose_loss_weight=0.0,
                  axis_loss_weights=(1.0, 1.0, 1.0),
+                 use_keypoint_confidence=False,
+                 keypoint_confidence_threshold=0.0,
                  pelvis_indices=(11, 12),
                  skeleton_edges=None,
                  test_cfg=dict(max_per_img=100),
@@ -144,6 +146,13 @@ class PETRHead(AnchorFreeHead):
         self.root_pose_loss_weight = root_pose_loss_weight
         self.axis_pose_loss_weight = axis_pose_loss_weight
         self.axis_loss_weights = tuple(float(x) for x in axis_loss_weights)
+        self.use_keypoint_confidence = bool(use_keypoint_confidence)
+        self.keypoint_confidence_threshold = float(
+            keypoint_confidence_threshold)
+        if not 0.0 <= self.keypoint_confidence_threshold <= 1.0:
+            raise ValueError(
+                'keypoint_confidence_threshold must be in [0, 1], got '
+                f'{self.keypoint_confidence_threshold}')
         self.pelvis_indices = pelvis_indices
         if skeleton_edges is None:
             skeleton_edges = (
@@ -951,6 +960,24 @@ class PETRHead(AnchorFreeHead):
         """
 
         num_bboxes = kpt_pred.size(0)
+        gt_keypoint_confidence = None
+        if self.use_keypoint_confidence:
+            expected_dims = self.coordinate_dims + 1
+            if (gt_keypoints.dim() != 3 or
+                    gt_keypoints.size(1) != self.num_keypoints or
+                    gt_keypoints.size(2) != expected_dims):
+                raise ValueError(
+                    'Confidence-weighted keypoints must have shape '
+                    f'(num_gt, {self.num_keypoints}, {expected_dims}), got '
+                    f'{tuple(gt_keypoints.shape)}')
+            gt_keypoint_confidence = gt_keypoints[..., self.coordinate_dims]
+            gt_keypoint_confidence = gt_keypoint_confidence.clamp(0.0, 1.0)
+            gt_keypoint_confidence = torch.where(
+                gt_keypoint_confidence >= self.keypoint_confidence_threshold,
+                gt_keypoint_confidence,
+                torch.zeros_like(gt_keypoint_confidence))
+            gt_keypoints = gt_keypoints[..., :self.coordinate_dims]
+
         # assigner and sampler
         assign_result = self.assigner.assign(cls_score, kpt_pred, gt_labels,
                                              gt_keypoints, gt_areas, img_meta)
@@ -970,15 +997,17 @@ class PETRHead(AnchorFreeHead):
         kpt_targets = torch.zeros_like(kpt_pred)
         kpt_weights = torch.zeros_like(kpt_pred)
         pos_gt_kpts = gt_keypoints[sampling_result.pos_assigned_gt_inds]
-        valid_idx = pos_gt_kpts.new_ones((pos_gt_kpts.shape[0],
-                                          pos_gt_kpts.shape[1]), dtype = torch.int64)
-        valid_idx = valid_idx > 0
         pos_kpt_weights = kpt_weights[pos_inds].reshape(
             pos_gt_kpts.shape[0],
             kpt_weights.shape[-1] // self.coordinate_dims,
             self.coordinate_dims)
-
-        pos_kpt_weights[valid_idx] = 1.0
+        if gt_keypoint_confidence is None:
+            pos_kpt_weights.fill_(1.0)
+        else:
+            pos_confidence = gt_keypoint_confidence[
+                sampling_result.pos_assigned_gt_inds]
+            pos_kpt_weights.copy_(
+                pos_confidence.unsqueeze(-1).expand_as(pos_kpt_weights))
         kpt_weights[pos_inds] = pos_kpt_weights.reshape(
             pos_kpt_weights.shape[0], kpt_pred.shape[-1])
 
